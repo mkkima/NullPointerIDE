@@ -31,7 +31,7 @@ import {
 } from "./utils/files";
 import { icon, type IconName } from "./ui/icons";
 
-const LAST_PROJECT_KEY = "nullpointer:last-project";
+const LEGACY_LAST_PROJECT_KEY = "nullpointer:last-project";
 const SIDEBAR_WIDTH_KEY = "nullpointer:sidebar-width";
 const ACTIVITYBAR_WIDTH = 56;
 const MIN_SIDEBAR_WIDTH = 320;
@@ -118,14 +118,8 @@ class NullPointerApp {
     this.syncChrome();
   }
 
-  async start(): Promise<void> {
-    const lastProject = this.readStorage(LAST_PROJECT_KEY);
-    if (!lastProject) return;
-    try {
-      await this.loadProject(lastProject, false);
-    } catch {
-      this.removeStorage(LAST_PROJECT_KEY);
-    }
+  start(): void {
+    this.removeStorage(LEGACY_LAST_PROJECT_KEY);
   }
 
   private bindEvents(): void {
@@ -227,7 +221,6 @@ class NullPointerApp {
       this.projectPath.textContent = snapshot.rootPath;
       this.projectPath.title = snapshot.rootPath;
       document.title = `${snapshot.name} — NullPointer`;
-      this.writeStorage(LAST_PROJECT_KEY, snapshot.rootPath);
       this.renderTree();
       this.renderTabs();
       this.renderGit();
@@ -423,7 +416,7 @@ class NullPointerApp {
     svg.classList.add("scm-graph-lines");
     svg.setAttribute("aria-hidden", "true");
     const laneCount = Math.max(currentLanes.length, nextLanes.length, 1);
-    svg.setAttribute("viewBox", `0 0 ${laneCount * 13 + 9} 54`);
+    svg.setAttribute("viewBox", `0 0 ${laneCount * 13 + 9} 48`);
     const laneX = (lane: number): number => 9 + lane * 13;
     const addPath = (fromLane: number, fromY: number, toLane: number, toY: number): void => {
       const path = document.createElementNS(namespace, "path");
@@ -437,17 +430,17 @@ class NullPointerApp {
     currentLanes.forEach((hash, lane) => {
       if (lane === commitLane) return;
       const nextLane = nextLanes.indexOf(hash);
-      if (nextLane >= 0) addPath(lane, 0, nextLane, 54);
+      if (nextLane >= 0) addPath(lane, 0, nextLane, 48);
     });
-    if (!firstRow) addPath(commitLane, 0, commitLane, 15);
+    if (!firstRow) addPath(commitLane, 0, commitLane, 14);
     parents.forEach((parent) => {
       const nextLane = nextLanes.indexOf(parent);
-      if (nextLane >= 0) addPath(commitLane, 15, nextLane, 54);
+      if (nextLane >= 0) addPath(commitLane, 14, nextLane, 48);
     });
 
     const node = document.createElementNS(namespace, "circle");
     node.setAttribute("cx", String(laneX(commitLane)));
-    node.setAttribute("cy", "15");
+    node.setAttribute("cy", "14");
     node.setAttribute("r", parents.length > 1 ? "4.5" : "3.5");
     if (parents.length > 1) node.classList.add("merge");
     svg.append(node);
@@ -1399,4 +1392,4 @@ element<HTMLElement>("#app").innerHTML = `
 `;
 
 const app = new NullPointerApp();
-void app.start();
+app.start();

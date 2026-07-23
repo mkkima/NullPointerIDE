@@ -18,8 +18,8 @@
     "windows": [
       {
         "title": "NullPointer",
-        "width": 1440,
-        "height": 900,
+        "width": 1600,
+        "height": 840,
         "minWidth": 900,
         "minHeight": 620,
         "center": true,
