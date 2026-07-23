@@ -3,13 +3,25 @@ import { EditorController } from "./editor/controller";
 import {
   chooseProjectFolder,
   createProjectEntry,
+  getGitWorkspace,
+  gitCommitRepository,
+  gitStageAll,
+  gitStageFile,
+  gitUnstageFile,
   openProject,
   readProjectFile,
   refreshProject,
   toAppError,
   writeProjectFile,
 } from "./services/native";
-import type { CreateKind, FileEntry, ProjectSnapshot } from "./types";
+import type {
+  CreateKind,
+  FileEntry,
+  GitFileChange,
+  GitRepository,
+  GitWorkspace,
+  ProjectSnapshot,
+} from "./types";
 import {
   basename,
   extension,
@@ -21,6 +33,9 @@ import { icon, type IconName } from "./ui/icons";
 
 const LAST_PROJECT_KEY = "nullpointer:last-project";
 const SIDEBAR_WIDTH_KEY = "nullpointer:sidebar-width";
+const ACTIVITYBAR_WIDTH = 56;
+const MIN_SIDEBAR_WIDTH = 320;
+const MAX_SIDEBAR_WIDTH = 640;
 
 function element<T extends HTMLElement>(selector: string): T {
   const value = document.querySelector<T>(selector);
@@ -36,6 +51,18 @@ class NullPointerApp {
   private readonly shell = element<HTMLElement>("#shell");
   private readonly projectName = element<HTMLElement>("#project-name");
   private readonly projectPath = element<HTMLElement>("#project-path");
+  private readonly sidebarTitle = element<HTMLElement>("#sidebar-title");
+  private readonly explorerView = element<HTMLElement>("#explorer-view");
+  private readonly explorerActions = element<HTMLElement>("#explorer-actions");
+  private readonly scmActions = element<HTMLElement>("#scm-actions");
+  private readonly scmView = element<HTMLElement>("#scm-view");
+  private readonly scmRepositories = element<HTMLElement>("#scm-repositories");
+  private readonly scmGraph = element<HTMLElement>("#scm-graph");
+  private readonly scmGraphBody = element<HTMLElement>("#scm-graph-body");
+  private readonly scmGraphRepository = element<HTMLSelectElement>("#scm-graph-repository");
+  private readonly scmGraphToggle = element<HTMLButtonElement>("#scm-graph-toggle");
+  private readonly scmRefreshButton = element<HTMLButtonElement>("#scm-refresh-button");
+  private readonly scmBadge = element<HTMLElement>("#scm-badge");
   private readonly tree = element<HTMLElement>("#file-tree");
   private readonly tabs = element<HTMLElement>("#tabs");
   private readonly welcome = element<HTMLElement>("#welcome");
@@ -56,10 +83,18 @@ class NullPointerApp {
   private readonly editor: EditorController;
 
   private project: ProjectSnapshot | null = null;
+  private gitWorkspace: GitWorkspace | null = null;
+  private gitError: string | null = null;
   private readonly expanded = new Set<string>();
+  private readonly collapsedRepositories = new Set<string>();
+  private readonly commitMessages = new Map<string, string>();
   private readonly dirty = new Set<string>();
   private readonly loadingFiles = new Set<string>();
+  private sidebarView: "explorer" | "source-control" = "explorer";
+  private graphRepository: string | null = null;
+  private graphCollapsed = false;
   private sidebarCollapsed = false;
+  private gitLoading = false;
   private quickMatches: FileEntry[] = [];
   private quickSelection = 0;
   private createKind: CreateKind = "file";
@@ -107,7 +142,11 @@ class NullPointerApp {
       this.showQuickOpen();
     });
     element<HTMLButtonElement>("#activity-explorer").addEventListener("click", () => {
-      if (this.sidebarCollapsed) this.toggleSidebar();
+      this.showSidebarView("explorer");
+    });
+    element<HTMLButtonElement>("#activity-source-control").addEventListener("click", () => {
+      this.showSidebarView("source-control");
+      void this.refreshGit();
     });
     element<HTMLButtonElement>("#activity-search").addEventListener("click", () => {
       this.showQuickOpen();
@@ -118,6 +157,22 @@ class NullPointerApp {
     this.saveButton.addEventListener("click", () => void this.saveActive());
     this.newEntryButton.addEventListener("click", () => this.showEntryDialog());
     this.refreshButton.addEventListener("click", () => void this.refreshTree());
+    this.scmRefreshButton.addEventListener("click", () => void this.refreshGit());
+    this.scmGraphToggle.addEventListener("click", () => {
+      this.graphCollapsed = !this.graphCollapsed;
+      this.renderGitGraph();
+    });
+    this.scmGraphRepository.addEventListener("change", () => {
+      this.graphRepository = this.scmGraphRepository.value;
+      this.renderGitGraph();
+    });
+    this.scmRepositories.addEventListener("click", (event) => {
+      void this.handleGitClick(event);
+    });
+    this.scmRepositories.addEventListener("input", (event) => this.handleGitMessageInput(event));
+    this.scmRepositories.addEventListener("keydown", (event) => {
+      void this.handleGitKeydown(event);
+    });
     this.tree.addEventListener("click", (event) => this.handleTreeClick(event));
     this.tabs.addEventListener("click", (event) => this.handleTabClick(event));
     this.quickInput.addEventListener("input", () => this.renderQuickResults());
@@ -159,6 +214,11 @@ class NullPointerApp {
     try {
       const snapshot = await openProject(path);
       this.project = snapshot;
+      this.gitWorkspace = null;
+      this.gitError = null;
+      this.commitMessages.clear();
+      this.collapsedRepositories.clear();
+      this.graphRepository = null;
       this.projectGeneration += 1;
       this.editor.reset();
       this.dirty.clear();
@@ -170,7 +230,9 @@ class NullPointerApp {
       this.writeStorage(LAST_PROJECT_KEY, snapshot.rootPath);
       this.renderTree();
       this.renderTabs();
+      this.renderGit();
       this.syncChrome();
+      if (this.sidebarView === "source-control") void this.refreshGit(true);
       if (snapshot.truncated) {
         this.toast("Project tree was capped at 20,000 entries.", "warning", 5000);
       } else if (announce) {
@@ -191,6 +253,496 @@ class NullPointerApp {
     } catch (error) {
       this.showError(error);
     } finally {
+      this.setBusy(false);
+    }
+  }
+
+  private async refreshGit(silent = false): Promise<void> {
+    if (!this.project || this.gitLoading) {
+      this.renderGit();
+      return;
+    }
+
+    this.gitLoading = true;
+    this.gitError = null;
+    this.scmView.classList.add("loading");
+    this.syncChrome();
+    if (!silent) this.setBusy(true, "Refreshing source control…");
+    try {
+      this.gitWorkspace = await getGitWorkspace();
+      this.renderGit();
+    } catch (error) {
+      const appError = toAppError(error);
+      this.gitWorkspace = null;
+      this.gitError = appError.message;
+      this.renderGit();
+      if (!silent) this.showError(appError);
+    } finally {
+      this.gitLoading = false;
+      this.scmView.classList.remove("loading");
+      this.syncChrome();
+      if (!silent) this.setBusy(false);
+    }
+  }
+
+  private renderGit(): void {
+    this.scmRepositories.replaceChildren();
+    this.renderGitGraph();
+    if (!this.project) {
+      this.scmRepositories.append(
+        this.gitEmptyState("Open a project folder to inspect source control."),
+      );
+      return;
+    }
+    if (this.gitError) {
+      this.scmRepositories.append(this.gitEmptyState(this.gitError, true));
+      return;
+    }
+    if (!this.gitWorkspace) {
+      this.scmRepositories.append(
+        this.gitEmptyState(this.gitLoading ? "Scanning repositories…" : "Refresh to scan Git repositories."),
+      );
+      return;
+    }
+    if (this.gitWorkspace.repositories.length === 0) {
+      this.scmRepositories.append(
+        this.gitEmptyState("No Git repositories found in this workspace."),
+      );
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    for (const repository of this.gitWorkspace.repositories) {
+      fragment.append(this.renderGitRepository(repository));
+    }
+    this.scmRepositories.append(fragment);
+  }
+
+  private renderGitGraph(): void {
+    const repositories = this.gitWorkspace?.repositories ?? [];
+    this.scmView.classList.toggle("graph-hidden", repositories.length === 0);
+    this.scmView.classList.toggle(
+      "graph-collapsed",
+      repositories.length > 0 && this.graphCollapsed,
+    );
+    this.scmGraph.classList.toggle("hidden", repositories.length === 0);
+    this.scmGraph.classList.toggle("collapsed", this.graphCollapsed);
+    this.scmGraphToggle.setAttribute("aria-expanded", String(!this.graphCollapsed));
+    this.scmGraphToggle.innerHTML =
+      `${icon(this.graphCollapsed ? "chevron-right" : "chevron-down", 14)}<strong>Graph</strong>`;
+    this.scmGraphBody.replaceChildren();
+    this.scmGraphRepository.replaceChildren();
+    if (repositories.length === 0) return;
+
+    const selected =
+      repositories.find((repository) => repository.relativePath === this.graphRepository) ??
+      repositories[0];
+    if (!selected) return;
+    this.graphRepository = selected.relativePath;
+
+    for (const repository of repositories) {
+      const option = document.createElement("option");
+      option.value = repository.relativePath;
+      option.textContent = repository.name;
+      option.title = repository.relativePath;
+      option.selected = repository.relativePath === selected.relativePath;
+      this.scmGraphRepository.append(option);
+    }
+
+    if (selected.commits.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "scm-graph-empty";
+      empty.textContent = "No commits yet";
+      this.scmGraphBody.append(empty);
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    let lanes: string[] = [];
+    selected.commits.forEach((commit, index) => {
+      if (!lanes.includes(commit.hash)) lanes.push(commit.hash);
+      const currentLanes = [...lanes];
+      const commitLane = currentLanes.indexOf(commit.hash);
+      const nextLanes = [...currentLanes];
+      nextLanes.splice(commitLane, 1, ...commit.parents);
+      lanes = nextLanes.filter(
+        (hash, laneIndex) => hash && nextLanes.indexOf(hash) === laneIndex,
+      );
+
+      const row = document.createElement("div");
+      row.className = "scm-graph-row";
+      row.title = commit.hash;
+      const laneCount = Math.max(currentLanes.length, lanes.length, 1);
+      row.style.setProperty("--graph-width", `${Math.max(28, laneCount * 13 + 9)}px`);
+      row.append(
+        this.renderCommitLanes(currentLanes, lanes, commitLane, commit.parents, index === 0),
+      );
+
+      const details = document.createElement("div");
+      details.className = "scm-graph-details";
+      const headline = document.createElement("div");
+      headline.className = "scm-graph-headline";
+      const summary = document.createElement("span");
+      summary.className = "scm-graph-summary";
+      summary.textContent = commit.summary || "(no commit message)";
+      headline.append(summary);
+      for (const reference of commit.refs) {
+        const badge = document.createElement("span");
+        badge.className = `scm-ref${reference.startsWith("HEAD -> ") ? " head" : ""}`;
+        badge.textContent = reference.replace(/^HEAD -> /, "");
+        badge.title = reference;
+        headline.append(badge);
+      }
+
+      const meta = document.createElement("div");
+      meta.className = "scm-graph-meta";
+      const hash = document.createElement("span");
+      hash.className = "scm-graph-hash";
+      hash.textContent = commit.shortHash;
+      const author = document.createElement("span");
+      author.textContent = commit.author;
+      const time = document.createElement("span");
+      time.textContent = commit.relativeTime;
+      meta.append(hash, author, time);
+      details.append(headline, meta);
+      row.append(details);
+      fragment.append(row);
+    });
+    this.scmGraphBody.append(fragment);
+  }
+
+  private renderCommitLanes(
+    currentLanes: readonly string[],
+    nextLanes: readonly string[],
+    commitLane: number,
+    parents: readonly string[],
+    firstRow: boolean,
+  ): SVGSVGElement {
+    const namespace = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(namespace, "svg");
+    svg.classList.add("scm-graph-lines");
+    svg.setAttribute("aria-hidden", "true");
+    const laneCount = Math.max(currentLanes.length, nextLanes.length, 1);
+    svg.setAttribute("viewBox", `0 0 ${laneCount * 13 + 9} 54`);
+    const laneX = (lane: number): number => 9 + lane * 13;
+    const addPath = (fromLane: number, fromY: number, toLane: number, toY: number): void => {
+      const path = document.createElementNS(namespace, "path");
+      const fromX = laneX(fromLane);
+      const toX = laneX(toLane);
+      const middle = (fromY + toY) / 2;
+      path.setAttribute("d", `M ${fromX} ${fromY} C ${fromX} ${middle}, ${toX} ${middle}, ${toX} ${toY}`);
+      svg.append(path);
+    };
+
+    currentLanes.forEach((hash, lane) => {
+      if (lane === commitLane) return;
+      const nextLane = nextLanes.indexOf(hash);
+      if (nextLane >= 0) addPath(lane, 0, nextLane, 54);
+    });
+    if (!firstRow) addPath(commitLane, 0, commitLane, 15);
+    parents.forEach((parent) => {
+      const nextLane = nextLanes.indexOf(parent);
+      if (nextLane >= 0) addPath(commitLane, 15, nextLane, 54);
+    });
+
+    const node = document.createElementNS(namespace, "circle");
+    node.setAttribute("cx", String(laneX(commitLane)));
+    node.setAttribute("cy", "15");
+    node.setAttribute("r", parents.length > 1 ? "4.5" : "3.5");
+    if (parents.length > 1) node.classList.add("merge");
+    svg.append(node);
+    return svg;
+  }
+
+  private gitEmptyState(message: string, error = false): HTMLElement {
+    const empty = document.createElement("div");
+    empty.className = `scm-empty${error ? " error" : ""}`;
+    empty.innerHTML = icon(error ? "x" : "git-branch", 24);
+    const text = document.createElement("p");
+    text.textContent = message;
+    empty.append(text);
+    return empty;
+  }
+
+  private renderGitRepository(repository: GitRepository): HTMLElement {
+    const section = document.createElement("section");
+    section.className = "scm-repository";
+    section.dataset.repository = repository.relativePath;
+
+    const collapsed = this.collapsedRepositories.has(repository.relativePath);
+    const header = document.createElement("button");
+    header.type = "button";
+    header.className = "scm-repo-header";
+    header.dataset.repositoryToggle = repository.relativePath;
+    header.title = repository.relativePath === "." ? repository.name : repository.relativePath;
+
+    const marker = document.createElement("span");
+    marker.className = "scm-repo-marker";
+    marker.innerHTML = icon(collapsed ? "chevron-right" : "chevron-down", 15);
+    const repositoryIcon = document.createElement("span");
+    repositoryIcon.className = "scm-repo-icon";
+    repositoryIcon.innerHTML = icon("git-branch", 17);
+    const name = document.createElement("strong");
+    name.className = "scm-repo-name";
+    name.textContent = repository.name;
+    const branch = document.createElement("span");
+    branch.className = "scm-branch";
+    branch.innerHTML = icon("git-branch", 14);
+    const branchName = document.createElement("span");
+    branchName.textContent = repository.detached ? `detached@${repository.branch}` : repository.branch;
+    branch.append(branchName);
+    if (repository.ahead > 0 || repository.behind > 0) {
+      const distance = document.createElement("span");
+      distance.className = "scm-distance";
+      distance.textContent = `↑${repository.ahead} ↓${repository.behind}`;
+      branch.append(distance);
+    }
+    header.append(marker, repositoryIcon, name, branch);
+    section.append(header);
+
+    const body = document.createElement("div");
+    body.className = "scm-repo-body";
+    body.hidden = collapsed;
+    const stagedChanges = repository.changes.filter((change) => change.indexStatus !== null);
+    const workingChanges = repository.changes.filter((change) => change.worktreeStatus !== null);
+    const message = this.commitMessages.get(repository.relativePath) ?? "";
+
+    const commitRow = document.createElement("div");
+    commitRow.className = "scm-commit";
+    const input = document.createElement("input");
+    input.className = "scm-commit-input";
+    input.dataset.commitRepository = repository.relativePath;
+    input.value = message;
+    input.maxLength = 500;
+    input.placeholder = `Message (Ctrl+Enter to commit on "${repository.branch}")`;
+    input.setAttribute("aria-label", `Commit message for ${repository.name}`);
+    const commitButton = document.createElement("button");
+    commitButton.type = "button";
+    commitButton.className = "scm-commit-button";
+    commitButton.dataset.gitAction = "commit";
+    commitButton.dataset.repository = repository.relativePath;
+    commitButton.disabled = stagedChanges.length === 0 || message.trim().length === 0;
+    commitButton.innerHTML = `${icon("check", 17)}<span>Commit</span>`;
+    commitRow.append(input, commitButton);
+    body.append(commitRow);
+
+    if (stagedChanges.length > 0) {
+      body.append(this.renderGitGroup(repository, "Staged Changes", stagedChanges, "staged"));
+    }
+    if (workingChanges.length > 0) {
+      body.append(this.renderGitGroup(repository, "Changes", workingChanges, "working"));
+    }
+    if (repository.changes.length === 0) {
+      const clean = document.createElement("div");
+      clean.className = "scm-clean";
+      clean.innerHTML = icon("check", 15);
+      const text = document.createElement("span");
+      text.textContent = "Working tree clean";
+      clean.append(text);
+      body.append(clean);
+    }
+
+    section.append(body);
+    return section;
+  }
+
+  private renderGitGroup(
+    repository: GitRepository,
+    title: string,
+    changes: readonly GitFileChange[],
+    scope: "staged" | "working",
+  ): HTMLElement {
+    const group = document.createElement("section");
+    group.className = "scm-group";
+    const header = document.createElement("div");
+    header.className = "scm-group-header";
+    const label = document.createElement("span");
+    label.innerHTML = icon("chevron-down", 14);
+    const text = document.createElement("strong");
+    text.textContent = title;
+    label.append(text);
+    const actions = document.createElement("span");
+    actions.className = "scm-group-actions";
+    const count = document.createElement("span");
+    count.className = "scm-count";
+    count.textContent = String(changes.length);
+    actions.append(count);
+    if (scope === "working") {
+      const stageAll = document.createElement("button");
+      stageAll.type = "button";
+      stageAll.className = "scm-inline-action";
+      stageAll.dataset.gitAction = "stage-all";
+      stageAll.dataset.repository = repository.relativePath;
+      stageAll.title = `Stage all changes in ${repository.name}`;
+      stageAll.setAttribute("aria-label", `Stage all changes in ${repository.name}`);
+      stageAll.innerHTML = icon("plus", 15);
+      actions.append(stageAll);
+    }
+    header.append(label, actions);
+    group.append(header);
+
+    for (const change of changes) {
+      const row = document.createElement("div");
+      row.className = "scm-file-row";
+      const status = scope === "staged" ? change.indexStatus : change.worktreeStatus;
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "scm-file-main";
+      open.dataset.gitOpen = change.path;
+      open.dataset.repository = repository.relativePath;
+      open.title = change.path;
+      open.disabled = status === "D";
+      const fileIcon = document.createElement("span");
+      fileIcon.className = `scm-file-icon ext-${escapeSelector(extension(change.path) || "plain")}`;
+      fileIcon.innerHTML = icon(
+        ["js", "jsx", "ts", "tsx", "rs", "html", "css", "json"].includes(extension(change.path))
+          ? "code"
+          : "file",
+        16,
+      );
+      const fileText = document.createElement("span");
+      fileText.className = "scm-file-text";
+      const fileName = document.createElement("span");
+      fileName.className = "scm-file-name";
+      fileName.textContent = basename(change.path);
+      const directory = document.createElement("span");
+      directory.className = "scm-file-directory";
+      const separator = change.path.lastIndexOf("/");
+      directory.textContent = separator > -1 ? change.path.slice(0, separator) : "";
+      fileText.append(fileName, directory);
+      open.append(fileIcon, fileText);
+
+      const code = document.createElement("span");
+      code.className = `scm-status status-${this.gitStatusLabel(status)}`;
+      code.textContent = this.gitStatusLabel(status);
+      code.title = this.gitStatusDescription(status);
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = "scm-file-action";
+      action.dataset.gitAction = scope === "staged" ? "unstage" : "stage";
+      action.dataset.repository = repository.relativePath;
+      action.dataset.path = change.path;
+      action.title = scope === "staged" ? "Unstage changes" : "Stage changes";
+      action.setAttribute("aria-label", `${action.title}: ${change.path}`);
+      action.innerHTML = icon(scope === "staged" ? "minus" : "plus", 15);
+      row.append(open, code, action);
+      group.append(row);
+    }
+    return group;
+  }
+
+  private gitStatusLabel(status: string | null): string {
+    return status === "?" ? "U" : (status ?? "M").toUpperCase();
+  }
+
+  private gitStatusDescription(status: string | null): string {
+    const descriptions: Readonly<Record<string, string>> = {
+      "?": "Untracked",
+      A: "Added",
+      C: "Copied",
+      D: "Deleted",
+      M: "Modified",
+      R: "Renamed",
+      T: "Type changed",
+      U: "Unmerged",
+    };
+    return descriptions[status ?? "M"] ?? "Changed";
+  }
+
+  private async handleGitClick(event: MouseEvent): Promise<void> {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const toggle = target.closest<HTMLButtonElement>("[data-repository-toggle]");
+    if (toggle?.dataset.repositoryToggle) {
+      const repository = toggle.dataset.repositoryToggle;
+      if (this.collapsedRepositories.has(repository)) this.collapsedRepositories.delete(repository);
+      else this.collapsedRepositories.add(repository);
+      this.renderGit();
+      return;
+    }
+
+    const action = target.closest<HTMLButtonElement>("[data-git-action]");
+    if (action?.dataset.gitAction && action.dataset.repository) {
+      await this.performGitAction(
+        action.dataset.gitAction,
+        action.dataset.repository,
+        action.dataset.path,
+      );
+      return;
+    }
+
+    const open = target.closest<HTMLButtonElement>("[data-git-open]");
+    if (open?.dataset.gitOpen && open.dataset.repository) {
+      const path =
+        open.dataset.repository === "."
+          ? open.dataset.gitOpen
+          : `${open.dataset.repository}/${open.dataset.gitOpen}`;
+      await this.openFile(path);
+    }
+  }
+
+  private handleGitMessageInput(event: Event): void {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement) || !input.dataset.commitRepository) return;
+    const repository = input.dataset.commitRepository;
+    this.commitMessages.set(repository, input.value);
+    const section = input.closest<HTMLElement>(".scm-repository");
+    const commitButton = section?.querySelector<HTMLButtonElement>('[data-git-action="commit"]');
+    const hasStaged = this.gitWorkspace?.repositories
+      .find((candidate) => candidate.relativePath === repository)
+      ?.changes.some((change) => change.indexStatus !== null);
+    if (commitButton) commitButton.disabled = !hasStaged || input.value.trim().length === 0;
+  }
+
+  private async handleGitKeydown(event: KeyboardEvent): Promise<void> {
+    const input = event.target;
+    if (
+      !(input instanceof HTMLInputElement) ||
+      !input.dataset.commitRepository ||
+      event.key !== "Enter" ||
+      !(event.ctrlKey || event.metaKey)
+    ) {
+      return;
+    }
+    event.preventDefault();
+    await this.performGitAction("commit", input.dataset.commitRepository);
+  }
+
+  private async performGitAction(
+    action: string,
+    repository: string,
+    path?: string,
+  ): Promise<void> {
+    if (this.gitLoading) return;
+    this.gitLoading = true;
+    this.scmView.classList.add("loading");
+    this.syncChrome();
+    this.setBusy(true, "Updating source control…");
+    try {
+      if (action === "stage" && path) {
+        this.gitWorkspace = await gitStageFile(repository, path);
+        this.toast(`Staged ${basename(path)}`, "success", 1600);
+      } else if (action === "unstage" && path) {
+        this.gitWorkspace = await gitUnstageFile(repository, path);
+        this.toast(`Unstaged ${basename(path)}`, "success", 1600);
+      } else if (action === "stage-all") {
+        this.gitWorkspace = await gitStageAll(repository);
+        this.toast("Staged all changes", "success", 1600);
+      } else if (action === "commit") {
+        const message = this.commitMessages.get(repository)?.trim() ?? "";
+        if (!message) return;
+        this.gitWorkspace = await gitCommitRepository(repository, message);
+        this.commitMessages.delete(repository);
+        this.toast("Commit created", "success", 1800);
+      }
+      this.gitError = null;
+      this.renderGit();
+    } catch (error) {
+      this.showError(error);
+    } finally {
+      this.gitLoading = false;
+      this.scmView.classList.remove("loading");
+      this.syncChrome();
       this.setBusy(false);
     }
   }
@@ -563,10 +1115,36 @@ class NullPointerApp {
     }
   }
 
+  private showSidebarView(view: "explorer" | "source-control"): void {
+    this.sidebarView = view;
+    if (this.sidebarCollapsed) {
+      this.sidebarCollapsed = false;
+      this.shell.classList.remove("sidebar-collapsed");
+    }
+    const sourceControl = view === "source-control";
+    this.sidebarTitle.textContent = sourceControl ? "Source Control" : "Explorer";
+    this.explorerView.classList.toggle("hidden", sourceControl);
+    this.explorerActions.classList.toggle("hidden", sourceControl);
+    this.scmView.classList.toggle("hidden", !sourceControl);
+    this.scmActions.classList.toggle("hidden", !sourceControl);
+    this.syncSidebarActivity();
+  }
+
   private toggleSidebar(): void {
     this.sidebarCollapsed = !this.sidebarCollapsed;
     this.shell.classList.toggle("sidebar-collapsed", this.sidebarCollapsed);
-    element<HTMLButtonElement>("#activity-explorer").classList.toggle("active", !this.sidebarCollapsed);
+    this.syncSidebarActivity();
+  }
+
+  private syncSidebarActivity(): void {
+    element<HTMLButtonElement>("#activity-explorer").classList.toggle(
+      "active",
+      !this.sidebarCollapsed && this.sidebarView === "explorer",
+    );
+    element<HTMLButtonElement>("#activity-source-control").classList.toggle(
+      "active",
+      !this.sidebarCollapsed && this.sidebarView === "source-control",
+    );
   }
 
   private syncChrome(): void {
@@ -578,6 +1156,10 @@ class NullPointerApp {
     this.saveButton.disabled = !active || !this.dirty.has(active);
     this.newEntryButton.disabled = !hasProject;
     this.refreshButton.disabled = !hasProject;
+    this.scmRefreshButton.disabled = !hasProject || this.gitLoading;
+    const sourceChanges = this.gitWorkspace?.totalChanges ?? 0;
+    this.scmBadge.textContent = sourceChanges > 99 ? "99+" : String(sourceChanges);
+    this.scmBadge.classList.toggle("hidden", !hasProject || sourceChanges === 0);
     this.cursorStatus.textContent = active ? this.cursorStatus.textContent : "Ln —, Col —";
     this.languageStatus.textContent = active ? languageName(active) : "Plain Text";
     this.generalStatus.textContent = active ? active : hasProject ? this.project?.rootPath ?? "" : "Ready";
@@ -625,7 +1207,10 @@ class NullPointerApp {
       if (this.sidebarCollapsed) return;
       resizer.setPointerCapture(event.pointerId);
       const onMove = (moveEvent: PointerEvent): void => {
-        const width = Math.min(420, Math.max(190, moveEvent.clientX - 48));
+        const width = Math.min(
+          MAX_SIDEBAR_WIDTH,
+          Math.max(MIN_SIDEBAR_WIDTH, moveEvent.clientX - ACTIVITYBAR_WIDTH),
+        );
         this.shell.style.setProperty("--sidebar-width", `${width}px`);
       };
       const onEnd = (): void => {
@@ -641,7 +1226,11 @@ class NullPointerApp {
 
   private restoreSidebarWidth(): void {
     const stored = this.readStorage(SIDEBAR_WIDTH_KEY);
-    if (stored && /^\d{3}px$/.test(stored)) this.shell.style.setProperty("--sidebar-width", stored);
+    const match = stored?.match(/^(\d{3})px$/);
+    if (!match) return;
+    const width = Number(match[1]);
+    const clamped = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
+    this.shell.style.setProperty("--sidebar-width", `${clamped}px`);
   }
 
   private readStorage(key: string): string | null {
@@ -700,6 +1289,10 @@ element<HTMLElement>("#app").innerHTML = `
       <button class="activity-button" id="activity-search" type="button" title="Quick open" aria-label="Quick open">
         ${icon("search", 23)}
       </button>
+      <button class="activity-button" id="activity-source-control" type="button" title="Source Control" aria-label="Source Control">
+        ${icon("git-branch", 23)}
+        <span class="activity-badge hidden" id="scm-badge">0</span>
+      </button>
       <span class="activity-spacer"></span>
       <button class="activity-button" id="toggle-sidebar-button" type="button" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar">
         ${icon("panel-left", 22)}
@@ -708,8 +1301,8 @@ element<HTMLElement>("#app").innerHTML = `
 
     <aside class="sidebar">
       <div class="sidebar-header">
-        <span>Explorer</span>
-        <div class="sidebar-actions">
+        <span id="sidebar-title">Explorer</span>
+        <div class="sidebar-actions" id="explorer-actions">
           <button class="mini-button" id="new-entry-button" type="button" title="New file or folder" aria-label="New file or folder">
             ${icon("file-plus", 18)}
           </button>
@@ -717,11 +1310,32 @@ element<HTMLElement>("#app").innerHTML = `
             ${icon("refresh", 17)}
           </button>
         </div>
+        <div class="sidebar-actions hidden" id="scm-actions">
+          <button class="mini-button" id="scm-refresh-button" type="button" title="Refresh source control" aria-label="Refresh source control">
+            ${icon("refresh", 17)}
+          </button>
+        </div>
       </div>
-      <div class="project-path" id="project-path">No project selected</div>
-      <nav class="file-tree" id="file-tree" aria-label="Project files">
-        <div class="tree-empty">Open a folder to browse its files.</div>
-      </nav>
+      <div class="explorer-view" id="explorer-view">
+        <div class="project-path" id="project-path">No project selected</div>
+        <nav class="file-tree" id="file-tree" aria-label="Project files">
+          <div class="tree-empty">Open a folder to browse its files.</div>
+        </nav>
+      </div>
+      <section class="scm-view hidden" id="scm-view" aria-label="Source control">
+        <div class="scm-repositories" id="scm-repositories">
+          <div class="scm-empty">${icon("git-branch", 24)}<p>Open a project folder to inspect source control.</p></div>
+        </div>
+        <section class="scm-graph hidden" id="scm-graph" aria-label="Commit graph">
+          <header class="scm-graph-header">
+            <button class="scm-graph-toggle" id="scm-graph-toggle" type="button" aria-expanded="true">
+              ${icon("chevron-down", 14)}<strong>Graph</strong>
+            </button>
+            <select class="scm-graph-repository" id="scm-graph-repository" aria-label="Graph repository"></select>
+          </header>
+          <div class="scm-graph-body" id="scm-graph-body"></div>
+        </section>
+      </section>
       <div class="sidebar-resizer" id="sidebar-resizer"></div>
     </aside>
 

@@ -1,3 +1,5 @@
+mod git;
+
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
@@ -305,6 +307,78 @@ fn create_project_entry(
     build_project_snapshot(&root)
 }
 
+#[tauri::command]
+async fn get_git_workspace(state: State<'_, AppState>) -> CommandResult<git::GitWorkspace> {
+    let root = current_root(&state)?;
+    run_git_task(move || git::workspace(&root)).await
+}
+
+#[tauri::command]
+async fn git_stage_file(
+    repository: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> CommandResult<git::GitWorkspace> {
+    let root = current_root(&state)?;
+    run_git_task(move || {
+        git::stage_file(&root, &repository, &path)?;
+        git::workspace(&root)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_unstage_file(
+    repository: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> CommandResult<git::GitWorkspace> {
+    let root = current_root(&state)?;
+    run_git_task(move || {
+        git::unstage_file(&root, &repository, &path)?;
+        git::workspace(&root)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_stage_all(
+    repository: String,
+    state: State<'_, AppState>,
+) -> CommandResult<git::GitWorkspace> {
+    let root = current_root(&state)?;
+    run_git_task(move || {
+        git::stage_all(&root, &repository)?;
+        git::workspace(&root)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_commit_repository(
+    repository: String,
+    message: String,
+    state: State<'_, AppState>,
+) -> CommandResult<git::GitWorkspace> {
+    let root = current_root(&state)?;
+    run_git_task(move || {
+        git::commit(&root, &repository, &message)?;
+        git::workspace(&root)
+    })
+    .await
+}
+
+async fn run_git_task<T, F>(task: F) -> CommandResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| CommandError::new("git_task_error", format!("Git task failed: {error}")))?
+        .map_err(|message| CommandError::new("git_error", message))
+}
+
 fn current_root(state: &State<'_, AppState>) -> CommandResult<PathBuf> {
     state
         .project_root
@@ -543,7 +617,12 @@ pub fn run() {
             refresh_project,
             read_project_file,
             write_project_file,
-            create_project_entry
+            create_project_entry,
+            get_git_workspace,
+            git_stage_file,
+            git_unstage_file,
+            git_stage_all,
+            git_commit_repository
         ])
         .run(tauri::generate_context!())
         .expect("failed to run NullPointer IDE");

@@ -4,6 +4,7 @@ import type {
   AppError,
   CreateKind,
   FileDocument,
+  GitWorkspace,
   ProjectSnapshot,
   SaveResult,
 } from "../types";
@@ -63,6 +64,34 @@ export async function createProjectEntry(
   return invoke<ProjectSnapshot>("create_project_entry", { relativePath, kind });
 }
 
+export async function getGitWorkspace(): Promise<GitWorkspace> {
+  requireDesktopRuntime();
+  return invoke<GitWorkspace>("get_git_workspace");
+}
+
+export async function gitStageFile(repository: string, path: string): Promise<GitWorkspace> {
+  requireDesktopRuntime();
+  return invoke<GitWorkspace>("git_stage_file", { repository, path });
+}
+
+export async function gitUnstageFile(repository: string, path: string): Promise<GitWorkspace> {
+  requireDesktopRuntime();
+  return invoke<GitWorkspace>("git_unstage_file", { repository, path });
+}
+
+export async function gitStageAll(repository: string): Promise<GitWorkspace> {
+  requireDesktopRuntime();
+  return invoke<GitWorkspace>("git_stage_all", { repository });
+}
+
+export async function gitCommitRepository(
+  repository: string,
+  message: string,
+): Promise<GitWorkspace> {
+  requireDesktopRuntime();
+  return invoke<GitWorkspace>("git_commit_repository", { repository, message });
+}
+
 export function toAppError(error: unknown): AppError {
   if (typeof error === "object" && error !== null) {
     const candidate = error as Record<string, unknown>;
@@ -78,4 +107,3 @@ export function toAppError(error: unknown): AppError {
   }
   return { code: "unknown", message: "An unexpected error occurred." };
 }
-

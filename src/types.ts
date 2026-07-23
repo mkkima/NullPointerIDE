@@ -34,3 +34,34 @@ export interface AppError {
 
 export type CreateKind = "file" | "directory";
 
+export interface GitWorkspace {
+  readonly repositories: readonly GitRepository[];
+  readonly totalChanges: number;
+}
+
+export interface GitRepository {
+  readonly relativePath: string;
+  readonly name: string;
+  readonly branch: string;
+  readonly detached: boolean;
+  readonly ahead: number;
+  readonly behind: number;
+  readonly changes: readonly GitFileChange[];
+  readonly commits: readonly GitCommit[];
+}
+
+export interface GitFileChange {
+  readonly path: string;
+  readonly indexStatus: string | null;
+  readonly worktreeStatus: string | null;
+}
+
+export interface GitCommit {
+  readonly hash: string;
+  readonly shortHash: string;
+  readonly parents: readonly string[];
+  readonly author: string;
+  readonly relativeTime: string;
+  readonly refs: readonly string[];
+  readonly summary: string;
+}

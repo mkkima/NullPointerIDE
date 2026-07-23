@@ -7,6 +7,7 @@ A focused, native code editor built with Tauri 2, TypeScript, Vite, and CodeMirr
 - Native folder picker and a Rust filesystem boundary: the UI can only read or write files inside the opened project.
 - Fast startup: no frontend framework, lazy-loaded language support, and a single CodeMirror instance.
 - Tabs with independent undo history, dirty-state protection, quick open, project tree, and keyboard-first controls.
+- Multi-repository Source Control with branch state, staged and working changes, stage/unstage, commits, and a compact history graph.
 - External-change detection, binary/oversized-file guards, bounded directory traversal, and safe path validation.
 
 ## Requirements
@@ -46,3 +47,5 @@ npm run tauri build
 ## Security model
 
 The selected project directory is canonicalized in Rust and stored as application state. Every file command resolves its target relative to that root and rejects traversal, symlink escapes, absolute paths, binary files, oversized reads, invalid names, and conflicting external writes. Tauri's content-security policy is enabled and the app exposes only the dialog permissions it needs.
+
+Git commands run directly without shell interpolation. Repository and file paths are validated against the open workspace before any staging or commit operation.
