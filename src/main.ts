@@ -17,6 +17,7 @@ import {
 import type {
   CreateKind,
   FileEntry,
+  GitCommitAction,
   GitFileChange,
   GitRepository,
   GitWorkspace,
@@ -33,6 +34,17 @@ import { icon, type IconName } from "./ui/icons";
 
 const LEGACY_LAST_PROJECT_KEY = "nullpointer:last-project";
 const SIDEBAR_WIDTH_KEY = "nullpointer:sidebar-width";
+const DEFAULT_COMMIT_ACTION: GitCommitAction = "commit-push";
+const GIT_COMMIT_OPTIONS: readonly {
+  readonly action: GitCommitAction;
+  readonly label: string;
+  readonly divider?: boolean;
+}[] = [
+  { action: "commit", label: "Commit" },
+  { action: "commit-amend", label: "Commit (Amend)" },
+  { action: "commit-push", label: "Commit & Push", divider: true },
+  { action: "commit-sync", label: "Commit & Sync" },
+];
 const ACTIVITYBAR_WIDTH = 56;
 const MIN_SIDEBAR_WIDTH = 320;
 const MAX_SIDEBAR_WIDTH = 640;
@@ -87,13 +99,16 @@ class NullPointerApp {
   private gitError: string | null = null;
   private readonly expanded = new Set<string>();
   private readonly collapsedRepositories = new Set<string>();
+  private readonly collapsedGitGroups = new Set<string>();
   private readonly commitMessages = new Map<string, string>();
   private readonly dirty = new Set<string>();
   private readonly loadingFiles = new Set<string>();
   private readonly disclosureAnimations = new WeakMap<HTMLElement, Animation>();
+  private readonly disclosureCleanupTimers = new WeakMap<HTMLElement, number>();
   private readonly viewAnimations = new WeakMap<HTMLElement, Animation>();
   private sidebarView: "explorer" | "source-control" = "explorer";
   private graphRepository: string | null = null;
+  private gitMenuSequence = 0;
   private graphCollapsed = false;
   private sidebarCollapsed = false;
   private gitLoading = false;
@@ -225,6 +240,7 @@ class NullPointerApp {
       this.gitError = null;
       this.commitMessages.clear();
       this.collapsedRepositories.clear();
+      this.collapsedGitGroups.clear();
       this.graphRepository = null;
       this.projectGeneration += 1;
       this.editor.reset();
@@ -386,13 +402,6 @@ class NullPointerApp {
       summary.className = "scm-graph-summary";
       summary.textContent = commit.summary || "(no commit message)";
       headline.append(summary);
-      for (const reference of commit.refs) {
-        const badge = document.createElement("span");
-        badge.className = `scm-ref${reference.startsWith("HEAD -> ") ? " head" : ""}`;
-        badge.textContent = reference.replace(/^HEAD -> /, "");
-        badge.title = reference;
-        headline.append(badge);
-      }
 
       const meta = document.createElement("div");
       meta.className = "scm-graph-meta";
@@ -422,7 +431,32 @@ class NullPointerApp {
     return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   }
 
-  private animateDisclosure(element: HTMLElement, expanding: boolean): void {
+  private cancelDisclosureCleanup(element: HTMLElement): void {
+    const timer = this.disclosureCleanupTimers.get(element);
+    if (timer === undefined) return;
+    window.clearTimeout(timer);
+    this.disclosureCleanupTimers.delete(element);
+  }
+
+  private scheduleDisclosureCleanup(
+    element: HTMLElement,
+    shouldClear: () => boolean,
+  ): void {
+    this.cancelDisclosureCleanup(element);
+    const timer = window.setTimeout(() => {
+      this.disclosureCleanupTimers.delete(element);
+      if (!element.hidden || !shouldClear()) return;
+      element.replaceChildren();
+      element.dataset.populated = "false";
+    }, 1_200);
+    this.disclosureCleanupTimers.set(element, timer);
+  }
+
+  private animateDisclosure(
+    element: HTMLElement,
+    expanding: boolean,
+    onSettled?: () => void,
+  ): void {
     const previous = this.disclosureAnimations.get(element);
     const interruptedHeight = previous ? element.getBoundingClientRect().height : null;
     const interruptedStyle = previous ? getComputedStyle(element) : null;
@@ -439,7 +473,7 @@ class NullPointerApp {
     const contentHeight = element.scrollHeight;
     const startHeight = interruptedHeight ?? (expanding ? 0 : contentHeight);
     const endHeight = expanding ? contentHeight : 0;
-    const fileCount = element.querySelectorAll(".scm-file-row").length;
+    const fileCount = element.getElementsByClassName("scm-file-row").length;
     const skipAnimation =
       this.prefersReducedMotion() ||
       !element.isConnected ||
@@ -451,6 +485,7 @@ class NullPointerApp {
       element.style.removeProperty("overflow");
       element.style.removeProperty("will-change");
       element.hidden = !expanding;
+      onSettled?.();
       return;
     }
 
@@ -502,6 +537,7 @@ class NullPointerApp {
       animation.cancel();
       element.style.removeProperty("overflow");
       element.style.removeProperty("will-change");
+      onSettled?.();
     };
     animation.onfinish = finish;
     animation.oncancel = () => {
@@ -653,9 +689,20 @@ class NullPointerApp {
     const body = document.createElement("div");
     body.className = "scm-repo-body";
     body.hidden = collapsed;
+    body.dataset.populated = String(!collapsed);
+    if (!collapsed) this.populateGitRepositoryBody(body, repository);
+    section.append(body);
+    return section;
+  }
+
+  private populateGitRepositoryBody(body: HTMLElement, repository: GitRepository): void {
+    body.replaceChildren();
     const stagedChanges = repository.changes.filter((change) => change.indexStatus !== null);
     const workingChanges = repository.changes.filter((change) => change.worktreeStatus !== null);
     const message = this.commitMessages.get(repository.relativePath) ?? "";
+    const hasMessage = message.trim().length > 0;
+    const canCommit = stagedChanges.length > 0 && hasMessage;
+    const canAmend = repository.commits.length > 0 && hasMessage;
 
     const commitRow = document.createElement("div");
     commitRow.className = "scm-commit";
@@ -668,12 +715,55 @@ class NullPointerApp {
     input.setAttribute("aria-label", `Commit message for ${repository.name}`);
     const commitButton = document.createElement("button");
     commitButton.type = "button";
-    commitButton.className = "scm-commit-button";
-    commitButton.dataset.gitAction = "commit";
+    commitButton.className = "scm-commit-button scm-commit-primary";
+    commitButton.dataset.gitAction = DEFAULT_COMMIT_ACTION;
+    commitButton.dataset.commitAction = DEFAULT_COMMIT_ACTION;
     commitButton.dataset.repository = repository.relativePath;
-    commitButton.disabled = stagedChanges.length === 0 || message.trim().length === 0;
-    commitButton.innerHTML = `${icon("check", 17)}<span>Commit</span>`;
-    commitRow.append(input, commitButton);
+    commitButton.disabled = !canCommit;
+    commitButton.textContent = "Commit & Push";
+
+    const commitControl = document.createElement("div");
+    commitControl.className = "scm-commit-control";
+    const menuId = `scm-commit-menu-${++this.gitMenuSequence}`;
+    const menuToggle = document.createElement("button");
+    menuToggle.type = "button";
+    menuToggle.className = "scm-commit-menu-toggle";
+    menuToggle.dataset.commitMenuTarget = menuId;
+    menuToggle.disabled = !canCommit && !canAmend;
+    menuToggle.title = "Select commit action";
+    menuToggle.setAttribute("aria-label", `Select commit action for ${repository.name}`);
+    menuToggle.setAttribute("aria-haspopup", "menu");
+    menuToggle.setAttribute("aria-controls", menuId);
+    menuToggle.innerHTML = icon("chevron-down", 15);
+
+    const menu = document.createElement("div");
+    menu.id = menuId;
+    menu.className = "scm-commit-menu";
+    menu.popover = "auto";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", `Commit actions for ${repository.name}`);
+    for (const option of GIT_COMMIT_OPTIONS) {
+      if (option.divider) {
+        const divider = document.createElement("div");
+        divider.className = "scm-commit-menu-divider";
+        divider.setAttribute("role", "separator");
+        menu.append(divider);
+      }
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "scm-commit-menu-item";
+      item.classList.toggle("default", option.action === DEFAULT_COMMIT_ACTION);
+      item.dataset.gitAction = option.action;
+      item.dataset.commitAction = option.action;
+      item.dataset.repository = repository.relativePath;
+      item.disabled = option.action === "commit-amend" ? !canAmend : !canCommit;
+      item.setAttribute("role", "menuitem");
+      item.textContent = option.label;
+      menu.append(item);
+    }
+
+    commitControl.append(commitButton, menuToggle, menu);
+    commitRow.append(input, commitControl);
     body.append(commitRow);
 
     if (stagedChanges.length > 0) {
@@ -691,9 +781,21 @@ class NullPointerApp {
       clean.append(text);
       body.append(clean);
     }
+    body.dataset.populated = "true";
+  }
 
-    section.append(body);
-    return section;
+  private ensureGitRepositoryBody(body: HTMLElement, repositoryPath: string): boolean {
+    if (body.dataset.populated === "true") return true;
+    const repository = this.gitWorkspace?.repositories.find(
+      (candidate) => candidate.relativePath === repositoryPath,
+    );
+    if (!repository) return false;
+    this.populateGitRepositoryBody(body, repository);
+    return true;
+  }
+
+  private gitGroupKey(repository: string, scope: "staged" | "working"): string {
+    return `${repository}\u0000${scope}`;
   }
 
   private renderGitGroup(
@@ -702,15 +804,29 @@ class NullPointerApp {
     changes: readonly GitFileChange[],
     scope: "staged" | "working",
   ): HTMLElement {
+    const collapsed = this.collapsedGitGroups.has(
+      this.gitGroupKey(repository.relativePath, scope),
+    );
     const group = document.createElement("section");
     group.className = "scm-group";
+    group.classList.toggle("collapsed", collapsed);
+    group.dataset.repository = repository.relativePath;
+    group.dataset.gitScope = scope;
     const header = document.createElement("div");
     header.className = "scm-group-header";
-    const label = document.createElement("span");
-    label.innerHTML = icon("chevron-down", 14);
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "scm-group-toggle";
+    toggle.dataset.gitGroupToggle = scope;
+    toggle.dataset.repository = repository.relativePath;
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.setAttribute("aria-label", `${collapsed ? "Show" : "Hide"} ${title}`);
+    const marker = document.createElement("span");
+    marker.className = "scm-group-marker";
+    marker.innerHTML = icon("chevron-down", 14);
     const text = document.createElement("strong");
     text.textContent = title;
-    label.append(text);
+    toggle.append(marker, text);
     const actions = document.createElement("span");
     actions.className = "scm-group-actions";
     const count = document.createElement("span");
@@ -728,9 +844,26 @@ class NullPointerApp {
       stageAll.innerHTML = icon("plus", 15);
       actions.append(stageAll);
     }
-    header.append(label, actions);
+    header.append(toggle, actions);
     group.append(header);
 
+    const body = document.createElement("div");
+    body.className = "scm-group-body";
+    body.hidden = collapsed;
+    body.dataset.populated = String(!collapsed);
+    if (!collapsed) this.populateGitGroupBody(body, repository, changes, scope);
+    group.append(body);
+    return group;
+  }
+
+  private populateGitGroupBody(
+    body: HTMLElement,
+    repository: GitRepository,
+    changes: readonly GitFileChange[],
+    scope: "staged" | "working",
+  ): void {
+    body.replaceChildren();
+    const fragment = document.createDocumentFragment();
     for (const change of changes) {
       const row = document.createElement("div");
       row.className = "scm-file-row";
@@ -776,9 +909,27 @@ class NullPointerApp {
       action.setAttribute("aria-label", `${action.title}: ${change.path}`);
       action.innerHTML = icon(scope === "staged" ? "minus" : "plus", 15);
       row.append(open, code, action);
-      group.append(row);
+      fragment.append(row);
     }
-    return group;
+    body.append(fragment);
+    body.dataset.populated = "true";
+  }
+
+  private ensureGitGroupBody(
+    body: HTMLElement,
+    repositoryPath: string,
+    scope: "staged" | "working",
+  ): boolean {
+    if (body.dataset.populated === "true") return true;
+    const repository = this.gitWorkspace?.repositories.find(
+      (candidate) => candidate.relativePath === repositoryPath,
+    );
+    if (!repository) return false;
+    const changes = repository.changes.filter((change) =>
+      scope === "staged" ? change.indexStatus !== null : change.worktreeStatus !== null,
+    );
+    this.populateGitGroupBody(body, repository, changes, scope);
+    return true;
   }
 
   private gitStatusLabel(status: string | null): string {
@@ -802,6 +953,69 @@ class NullPointerApp {
   private async handleGitClick(event: MouseEvent): Promise<void> {
     const target = event.target;
     if (!(target instanceof Element)) return;
+    const commitMenuToggle = target.closest<HTMLButtonElement>("[data-commit-menu-target]");
+    if (commitMenuToggle?.dataset.commitMenuTarget) {
+      const menu = document.getElementById(commitMenuToggle.dataset.commitMenuTarget);
+      if (!(menu instanceof HTMLElement)) return;
+      if (menu.matches(":popover-open")) {
+        menu.hidePopover();
+        return;
+      }
+      menu.style.visibility = "hidden";
+      menu.style.left = "0";
+      menu.style.top = "0";
+      menu.showPopover();
+      const toggleRect = commitMenuToggle.getBoundingClientRect();
+      const menuRect = menu.getBoundingClientRect();
+      const left = Math.max(
+        8,
+        Math.min(toggleRect.right - menuRect.width, window.innerWidth - menuRect.width - 8),
+      );
+      const below = toggleRect.bottom + 5;
+      const top =
+        below + menuRect.height <= window.innerHeight - 8
+          ? below
+          : Math.max(8, toggleRect.top - menuRect.height - 5);
+      menu.style.left = `${Math.round(left)}px`;
+      menu.style.top = `${Math.round(top)}px`;
+      menu.style.removeProperty("visibility");
+      return;
+    }
+
+    const groupToggle = target.closest<HTMLButtonElement>("[data-git-group-toggle]");
+    if (
+      groupToggle?.dataset.repository &&
+      (groupToggle.dataset.gitGroupToggle === "staged" ||
+        groupToggle.dataset.gitGroupToggle === "working")
+    ) {
+      const repository = groupToggle.dataset.repository;
+      const scope = groupToggle.dataset.gitGroupToggle;
+      const key = this.gitGroupKey(repository, scope);
+      const group = groupToggle.closest<HTMLElement>(".scm-group");
+      const body = group?.querySelector<HTMLElement>(".scm-group-body");
+      if (!group || !body) return;
+      const expanding = this.collapsedGitGroups.has(key);
+      if (expanding) {
+        this.cancelDisclosureCleanup(body);
+        if (!this.ensureGitGroupBody(body, repository, scope)) return;
+        this.collapsedGitGroups.delete(key);
+      } else {
+        this.collapsedGitGroups.add(key);
+      }
+      group.classList.toggle("collapsed", !expanding);
+      groupToggle.setAttribute("aria-expanded", String(expanding));
+      groupToggle.setAttribute(
+        "aria-label",
+        `${expanding ? "Hide" : "Show"} ${scope === "staged" ? "Staged Changes" : "Changes"}`,
+      );
+      this.animateDisclosure(body, expanding, () => {
+        if (!expanding) {
+          this.scheduleDisclosureCleanup(body, () => this.collapsedGitGroups.has(key));
+        }
+      });
+      return;
+    }
+
     const toggle = target.closest<HTMLButtonElement>("[data-repository-toggle]");
     if (toggle?.dataset.repositoryToggle) {
       const repository = toggle.dataset.repositoryToggle;
@@ -809,16 +1023,29 @@ class NullPointerApp {
       const body = section?.querySelector<HTMLElement>(".scm-repo-body");
       if (!section || !body) return;
       const expanding = this.collapsedRepositories.has(repository);
-      if (expanding) this.collapsedRepositories.delete(repository);
-      else this.collapsedRepositories.add(repository);
+      if (expanding) {
+        this.cancelDisclosureCleanup(body);
+        if (!this.ensureGitRepositoryBody(body, repository)) return;
+        this.collapsedRepositories.delete(repository);
+      } else {
+        this.collapsedRepositories.add(repository);
+      }
       section.classList.toggle("collapsed", !expanding);
       toggle.setAttribute("aria-expanded", String(expanding));
-      this.animateDisclosure(body, expanding);
+      this.animateDisclosure(body, expanding, () => {
+        if (!expanding) {
+          this.scheduleDisclosureCleanup(body, () =>
+            this.collapsedRepositories.has(repository),
+          );
+        }
+      });
       return;
     }
 
     const action = target.closest<HTMLButtonElement>("[data-git-action]");
     if (action?.dataset.gitAction && action.dataset.repository) {
+      const menu = action.closest<HTMLElement>(".scm-commit-menu");
+      if (menu?.matches(":popover-open")) menu.hidePopover();
       await this.performGitAction(
         action.dataset.gitAction,
         action.dataset.repository,
@@ -843,11 +1070,21 @@ class NullPointerApp {
     const repository = input.dataset.commitRepository;
     this.commitMessages.set(repository, input.value);
     const section = input.closest<HTMLElement>(".scm-repository");
-    const commitButton = section?.querySelector<HTMLButtonElement>('[data-git-action="commit"]');
-    const hasStaged = this.gitWorkspace?.repositories
-      .find((candidate) => candidate.relativePath === repository)
-      ?.changes.some((change) => change.indexStatus !== null);
-    if (commitButton) commitButton.disabled = !hasStaged || input.value.trim().length === 0;
+    const snapshot = this.gitWorkspace?.repositories.find(
+      (candidate) => candidate.relativePath === repository,
+    );
+    const hasStaged = snapshot?.changes.some((change) => change.indexStatus !== null) ?? false;
+    const hasCommit = (snapshot?.commits.length ?? 0) > 0;
+    const hasMessage = input.value.trim().length > 0;
+    const actionButtons =
+      section?.querySelectorAll<HTMLButtonElement>("[data-commit-action]") ?? [];
+    for (const button of actionButtons) {
+      button.disabled =
+        !hasMessage ||
+        (button.dataset.commitAction === "commit-amend" ? !hasCommit : !hasStaged);
+    }
+    const menuToggle = section?.querySelector<HTMLButtonElement>("[data-commit-menu-target]");
+    if (menuToggle) menuToggle.disabled = !hasMessage || (!hasStaged && !hasCommit);
   }
 
   private async handleGitKeydown(event: KeyboardEvent): Promise<void> {
@@ -861,7 +1098,12 @@ class NullPointerApp {
       return;
     }
     event.preventDefault();
-    await this.performGitAction("commit", input.dataset.commitRepository);
+    const section = input.closest<HTMLElement>(".scm-repository");
+    const primary = section?.querySelector<HTMLButtonElement>(
+      `[data-commit-action="${DEFAULT_COMMIT_ACTION}"]`,
+    );
+    if (primary?.disabled) return;
+    await this.performGitAction(DEFAULT_COMMIT_ACTION, input.dataset.commitRepository);
   }
 
   private async performGitAction(
@@ -884,12 +1126,23 @@ class NullPointerApp {
       } else if (action === "stage-all") {
         this.gitWorkspace = await gitStageAll(repository);
         this.toast("Staged all changes", "success", 1600);
-      } else if (action === "commit") {
+      } else if (this.isGitCommitAction(action)) {
         const message = this.commitMessages.get(repository)?.trim() ?? "";
         if (!message) return;
-        this.gitWorkspace = await gitCommitRepository(repository, message);
+        const result = await gitCommitRepository(repository, message, action);
+        this.gitWorkspace = result.workspace;
         this.commitMessages.delete(repository);
-        this.toast("Commit created", "success", 1800);
+        if (result.warning) {
+          this.toast(result.warning, "warning", 6000);
+        } else {
+          const successMessages: Readonly<Record<GitCommitAction, string>> = {
+            commit: "Commit created",
+            "commit-amend": "Commit amended",
+            "commit-push": "Commit pushed",
+            "commit-sync": "Commit synchronized",
+          };
+          this.toast(successMessages[action], "success", 1800);
+        }
       }
       this.gitError = null;
       this.renderGit();
@@ -901,6 +1154,10 @@ class NullPointerApp {
       this.syncChrome();
       this.setBusy(false);
     }
+  }
+
+  private isGitCommitAction(action: string): action is GitCommitAction {
+    return GIT_COMMIT_OPTIONS.some((option) => option.action === action);
   }
 
   private renderTree(): void {

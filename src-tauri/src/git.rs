@@ -48,7 +48,6 @@ pub(crate) struct GitCommit {
     pub(crate) parents: Vec<String>,
     pub(crate) author: String,
     pub(crate) relative_time: String,
-    pub(crate) refs: Vec<String>,
     pub(crate) summary: String,
 }
 
@@ -110,6 +109,30 @@ pub(crate) fn stage_all(root: &Path, repository: &str) -> Result<(), String> {
 
 pub(crate) fn commit(root: &Path, repository: &str, message: &str) -> Result<(), String> {
     let repository = resolve_repository(root, repository)?;
+    let message = validate_commit_message(message)?;
+    run_mutating_git(&repository, ["commit", "--message", message]).map(|_| ())
+}
+
+pub(crate) fn amend(root: &Path, repository: &str, message: &str) -> Result<(), String> {
+    let repository = resolve_repository(root, repository)?;
+    let message = validate_commit_message(message)?;
+    run_mutating_git(&repository, ["commit", "--amend", "--message", message]).map(|_| ())
+}
+
+pub(crate) fn push(root: &Path, repository: &str) -> Result<(), String> {
+    let repository = resolve_repository(root, repository)?;
+    push_repository(&repository)
+}
+
+pub(crate) fn sync(root: &Path, repository: &str) -> Result<(), String> {
+    let repository = resolve_repository(root, repository)?;
+    if has_upstream(&repository) {
+        run_mutating_git(&repository, ["pull", "--rebase", "--autostash"])?;
+    }
+    push_repository(&repository)
+}
+
+fn validate_commit_message(message: &str) -> Result<&str, String> {
     let message = message.trim();
     if message.is_empty() {
         return Err("Enter a commit message first.".to_owned());
@@ -123,8 +146,41 @@ pub(crate) fn commit(root: &Path, repository: &str, message: &str) -> Result<(),
     {
         return Err("The commit message contains unsupported control characters.".to_owned());
     }
+    Ok(message)
+}
 
-    run_mutating_git(&repository, ["commit", "--message", message]).map(|_| ())
+fn has_upstream(repository: &Path) -> bool {
+    run_readonly_git(
+        repository,
+        [
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .is_ok()
+}
+
+fn push_repository(repository: &Path) -> Result<(), String> {
+    if has_upstream(repository) {
+        return run_mutating_git(repository, ["push"]).map(|_| ());
+    }
+
+    let (branch, detached) = current_branch(repository)?;
+    if detached {
+        return Err("Cannot push while HEAD is detached. Check out a branch first.".to_owned());
+    }
+    if run_readonly_git(repository, ["remote", "get-url", "origin"]).is_err() {
+        return Err(
+            "No upstream is configured and the repository has no \"origin\" remote.".to_owned(),
+        );
+    }
+    run_mutating_git(
+        repository,
+        ["push", "--set-upstream", "origin", branch.as_str()],
+    )
+    .map(|_| ())
 }
 
 fn ensure_git_available() -> Result<(), String> {
@@ -242,8 +298,7 @@ fn recent_commits(repository: &Path) -> Vec<GitCommit> {
             "log",
             max_count.as_str(),
             "--date=relative",
-            "--decorate=short",
-            "--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%ar%x1f%D%x1f%s%x1e",
+            "--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%ar%x1f%s%x1e",
         ],
     );
     output
@@ -260,10 +315,10 @@ fn parse_commit_log(bytes: &[u8]) -> Vec<GitCommit> {
                 return None;
             }
             let fields = record
-                .splitn(7, |byte| *byte == 0x1f)
+                .splitn(6, |byte| *byte == 0x1f)
                 .map(|field| String::from_utf8_lossy(field).into_owned())
                 .collect::<Vec<_>>();
-            if fields.len() != 7 || fields[0].is_empty() {
+            if fields.len() != 6 || fields[0].is_empty() {
                 return None;
             }
 
@@ -273,12 +328,7 @@ fn parse_commit_log(bytes: &[u8]) -> Vec<GitCommit> {
                 parents: fields[2].split_whitespace().map(str::to_owned).collect(),
                 author: fields[3].clone(),
                 relative_time: fields[4].clone(),
-                refs: fields[5]
-                    .split(", ")
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-                summary: fields[6].clone(),
+                summary: fields[5].clone(),
             })
         })
         .collect()
@@ -536,8 +586,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_graph_commits_and_refs() {
-        let log = b"0123456789abcdef\x1f0123456\x1fparent-a parent-b\x1fAda Lovelace\x1f2 hours ago\x1fHEAD -> main, tag: v1.0\x1fShip graph\x1e\n";
+    fn parses_graph_commits() {
+        let log = b"0123456789abcdef\x1f0123456\x1fparent-a parent-b\x1fAda Lovelace\x1f2 hours ago\x1fShip graph\x1e\n";
         let commits = parse_commit_log(log);
 
         assert_eq!(
@@ -548,7 +598,6 @@ mod tests {
                 parents: vec!["parent-a".to_owned(), "parent-b".to_owned()],
                 author: "Ada Lovelace".to_owned(),
                 relative_time: "2 hours ago".to_owned(),
-                refs: vec!["HEAD -> main".to_owned(), "tag: v1.0".to_owned()],
                 summary: "Ship graph".to_owned(),
             }]
         );
@@ -648,5 +697,30 @@ mod tests {
             clean.repositories[0].commits[0].summary,
             "tested source control"
         );
+
+        amend(&repository, ".", "amended source control").expect("amend commit");
+        let amended = workspace(&repository).expect("amended snapshot");
+        assert_eq!(
+            amended.repositories[0].commits[0].summary,
+            "amended source control"
+        );
+
+        let remote = TempDir::new().expect("temporary remote");
+        let init_remote = Command::new("git")
+            .arg("-C")
+            .arg(remote.path())
+            .args(["init", "--bare"])
+            .output()
+            .expect("initialize remote");
+        assert!(init_remote.status.success());
+        let remote_path = remote.path().to_string_lossy();
+        run_mutating_git(
+            &repository,
+            ["remote", "add", "origin", remote_path.as_ref()],
+        )
+        .expect("configure remote");
+        push(&repository, ".").expect("push and configure upstream");
+        assert!(has_upstream(&repository));
+        sync(&repository, ".").expect("sync repository");
     }
 }

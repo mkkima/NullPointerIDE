@@ -18,6 +18,22 @@ const MAX_TREE_DEPTH: usize = 32;
 
 type CommandResult<T> = Result<T, CommandError>;
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum GitCommitAction {
+    Commit,
+    CommitAmend,
+    CommitPush,
+    CommitSync,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCommitResult {
+    workspace: git::GitWorkspace,
+    warning: Option<String>,
+}
+
 #[derive(Default)]
 struct AppState {
     project_root: RwLock<Option<PathBuf>>,
@@ -358,12 +374,37 @@ async fn git_stage_all(
 async fn git_commit_repository(
     repository: String,
     message: String,
+    action: GitCommitAction,
     state: State<'_, AppState>,
-) -> CommandResult<git::GitWorkspace> {
+) -> CommandResult<GitCommitResult> {
     let root = current_root(&state)?;
     run_git_task(move || {
-        git::commit(&root, &repository, &message)?;
-        git::workspace(&root)
+        let warning = match action {
+            GitCommitAction::Commit => {
+                git::commit(&root, &repository, &message)?;
+                None
+            }
+            GitCommitAction::CommitAmend => {
+                git::amend(&root, &repository, &message)?;
+                None
+            }
+            GitCommitAction::CommitPush => {
+                git::commit(&root, &repository, &message)?;
+                git::push(&root, &repository)
+                    .err()
+                    .map(|error| format!("Commit created, but push failed: {error}"))
+            }
+            GitCommitAction::CommitSync => {
+                git::commit(&root, &repository, &message)?;
+                git::sync(&root, &repository)
+                    .err()
+                    .map(|error| format!("Commit created, but sync failed: {error}"))
+            }
+        };
+        Ok(GitCommitResult {
+            workspace: git::workspace(&root)?,
+            warning,
+        })
     })
     .await
 }

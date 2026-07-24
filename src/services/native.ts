@@ -4,6 +4,8 @@ import type {
   AppError,
   CreateKind,
   FileDocument,
+  GitCommitAction,
+  GitCommitResult,
   GitWorkspace,
   ProjectSnapshot,
   SaveResult,
@@ -87,9 +89,10 @@ export async function gitStageAll(repository: string): Promise<GitWorkspace> {
 export async function gitCommitRepository(
   repository: string,
   message: string,
-): Promise<GitWorkspace> {
+  action: GitCommitAction,
+): Promise<GitCommitResult> {
   requireDesktopRuntime();
-  return invoke<GitWorkspace>("git_commit_repository", { repository, message });
+  return invoke<GitCommitResult>("git_commit_repository", { repository, message, action });
 }
 
 export function toAppError(error: unknown): AppError {

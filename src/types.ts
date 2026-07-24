@@ -39,6 +39,13 @@ export interface GitWorkspace {
   readonly totalChanges: number;
 }
 
+export type GitCommitAction = "commit" | "commit-amend" | "commit-push" | "commit-sync";
+
+export interface GitCommitResult {
+  readonly workspace: GitWorkspace;
+  readonly warning: string | null;
+}
+
 export interface GitRepository {
   readonly relativePath: string;
   readonly name: string;
@@ -62,6 +69,5 @@ export interface GitCommit {
   readonly parents: readonly string[];
   readonly author: string;
   readonly relativeTime: string;
-  readonly refs: readonly string[];
   readonly summary: string;
 }

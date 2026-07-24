@@ -420,6 +420,8 @@ kbd {
 .scm-empty p { margin: 0; font-size: 14px; line-height: 1.6; }
 
 .scm-repository {
+  --scm-content-inset: 24px;
+  --scm-edge: 7px;
   margin: 0 5px 4px;
   overflow: hidden;
   border: 1px solid #1d1d1d;
@@ -435,7 +437,7 @@ kbd {
   align-items: center;
   width: 100%;
   height: 34px;
-  padding: 0 8px 0 6px;
+  padding: 0 var(--scm-edge) 0 6px;
   border: 0;
   color: #cecece;
   background: transparent;
@@ -491,7 +493,7 @@ kbd {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 5px;
-  padding: 2px 7px 5px 24px;
+  padding: 2px var(--scm-edge) 5px var(--scm-content-inset);
 }
 
 .scm-commit-input {
@@ -513,24 +515,96 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
+  min-width: 0;
   height: 32px;
-  padding: 0 10px;
-  border: 1px solid #e8e8e8;
-  border-radius: 8px;
-  color: #000;
-  background: #e8e8e8;
+  padding: 0 8px;
+  border: 1px solid #35415b;
+  border-right: 0;
+  border-radius: 8px 0 0 8px;
+  overflow: hidden;
+  color: #f0f3fa;
+  background: #192238;
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.scm-commit-button:hover:not(:disabled) { background: #fff; }
-.scm-commit-button:disabled {
+.scm-commit-button:hover:not(:disabled),
+.scm-commit-menu-toggle:hover:not(:disabled) { background: #24304b; }
+
+.scm-commit-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  width: 145px;
+  min-width: 0;
+}
+
+.scm-commit-menu-toggle {
+  display: grid;
+  width: 28px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid #35415b;
+  border-radius: 0 8px 8px 0;
+  place-items: center;
+  color: #d8dfed;
+  background: #192238;
+  cursor: pointer;
+}
+
+.scm-commit-button:disabled,
+.scm-commit-menu-toggle:disabled {
   border-color: #303030;
   color: #7b7b7b;
   background: #101010;
   cursor: default;
+}
+
+.scm-commit-menu {
+  position: fixed;
+  inset: auto;
+  z-index: 500;
+  width: 188px;
+  margin: 0;
+  padding: 5px;
+  border: 1px solid #293248;
+  border-radius: 9px;
+  color: #e9edf5;
+  background: #111827;
+  box-shadow: 0 12px 32px #000a;
+}
+
+.scm-commit-menu::backdrop { background: transparent; }
+
+.scm-commit-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 31px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  text-align: left;
+}
+
+.scm-commit-menu-item:hover:not(:disabled),
+.scm-commit-menu-item:focus-visible {
+  outline: 0;
+  background: #25304a;
+}
+
+.scm-commit-menu-item.default { color: #fff; }
+.scm-commit-menu-item:disabled { color: #667085; cursor: default; }
+.scm-commit-menu-divider {
+  height: 1px;
+  margin: 4px -5px;
+  background: #2b3448;
 }
 
 .scm-group { padding-bottom: 3px; }
@@ -539,18 +613,49 @@ kbd {
   align-items: center;
   justify-content: space-between;
   height: 28px;
-  padding: 0 7px 0 22px;
+  padding: 0 var(--scm-edge) 0 var(--scm-content-inset);
   color: #c7c7c7;
 }
 
-.scm-group-header > span:first-child,
+.scm-group-toggle,
 .scm-group-actions {
   display: flex;
   align-items: center;
   gap: 5px;
 }
 
-.scm-group-header strong { font-size: 13px; font-weight: 600; }
+.scm-group-toggle {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.scm-group-toggle:focus-visible {
+  border-radius: var(--radius-sm);
+  box-shadow: 0 0 0 1px #777;
+}
+
+.scm-group-marker {
+  display: grid;
+  flex: 0 0 18px;
+  place-items: center;
+  transform-origin: center;
+  transition: transform var(--motion-fast) var(--motion-ease);
+}
+
+.scm-group.collapsed .scm-group-marker { transform: rotate(-90deg); }
+.scm-group-toggle strong { font-size: 13px; font-weight: 600; }
+.scm-group-body {
+  min-width: 0;
+  contain: layout paint;
+}
 .scm-count {
   display: grid;
   place-items: center;
@@ -585,7 +690,7 @@ kbd {
   grid-template-columns: minmax(0, 1fr) 22px 24px;
   align-items: center;
   min-height: 30px;
-  padding: 0 5px 0 24px;
+  padding: 0 var(--scm-edge) 0 var(--scm-content-inset);
   border-radius: 6px;
 }
 
@@ -663,8 +768,8 @@ kbd {
 .scm-clean {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 12px 7px 25px;
+  gap: 6px;
+  padding: 7px var(--scm-edge) 7px var(--scm-content-inset);
   color: #a5a5a5;
   font-size: 13px;
 }
@@ -817,26 +922,6 @@ kbd {
   line-height: 17px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.scm-ref {
-  flex: 0 0 auto;
-  max-width: 110px;
-  overflow: hidden;
-  padding: 0 4px;
-  border: 1px solid #383838;
-  border-radius: 6px;
-  color: #bdbdbd;
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 17px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.scm-ref.head {
-  border-color: #8a8a8a;
-  color: #e2e2e2;
 }
 
 .scm-graph-meta {
