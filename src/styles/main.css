@@ -490,8 +490,13 @@ kbd {
 
 .scm-distance { color: #a0a0a0; font-size: 12px; }
 .scm-repo-body {
-  contain: layout paint;
-  padding-bottom: 4px;
+  contain: layout;
+}
+
+.scm-repo-body::after {
+  display: block;
+  height: 4px;
+  content: "";
 }
 
 .scm-commit {
@@ -659,7 +664,7 @@ kbd {
 .scm-group-toggle strong { font-size: 13px; font-weight: 600; }
 .scm-group-body {
   min-width: 0;
-  contain: layout paint;
+  contain: layout;
 }
 .scm-count {
   display: grid;

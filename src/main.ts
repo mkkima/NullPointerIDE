@@ -606,7 +606,6 @@ class NullPointerApp {
     const interruptedOpacity = interruptedStyle
       ? Number.parseFloat(interruptedStyle.opacity)
       : null;
-    const interruptedTransform = interruptedStyle?.transform ?? null;
     if (previous) {
       this.disclosureAnimations.delete(element);
       previous.cancel();
@@ -638,12 +637,6 @@ class NullPointerApp {
         : expanding
           ? 0
           : 1;
-    const startTransform =
-      interruptedTransform && interruptedTransform !== "none"
-        ? interruptedTransform
-        : expanding
-          ? "translateY(-4px)"
-          : "translateY(0)";
     const distanceRatio = Math.min(
       1,
       Math.abs(endHeight - startHeight) / Math.max(contentHeight, 1),
@@ -652,18 +645,16 @@ class NullPointerApp {
       Math.max(70, (expanding ? 155 : 125) * distanceRatio),
     );
     element.style.overflow = "hidden";
-    element.style.willChange = "height, opacity, transform";
+    element.style.willChange = "height, opacity";
     const animation = element.animate(
       [
         {
           height: `${startHeight}px`,
           opacity: startOpacity,
-          transform: startTransform,
         },
         {
           height: `${endHeight}px`,
           opacity: expanding ? 1 : 0,
-          transform: expanding ? "translateY(0)" : "translateY(-4px)",
         },
       ],
       {
