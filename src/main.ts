@@ -222,9 +222,25 @@ class NullPointerApp {
     });
     this.tree.addEventListener("click", (event) => this.handleTreeClick(event));
     this.tabs.addEventListener("click", (event) => this.handleTabClick(event));
+    this.tabs.addEventListener("pointerdown", (event) => {
+      const target = event.target;
+      if (
+        event.button === 1 &&
+        target instanceof Element &&
+        target.closest(".tab")
+      ) {
+        event.preventDefault();
+      }
+    });
+    this.tabs.addEventListener("auxclick", (event) => this.handleTabAuxClick(event));
     this.quickInput.addEventListener("input", () => this.renderQuickResults());
     this.quickInput.addEventListener("keydown", (event) => this.handleQuickKeydown(event));
     this.quickResults.addEventListener("click", (event) => this.handleQuickClick(event));
+    this.quickDialog.addEventListener("pointerdown", (event) => {
+      if (event.button === 0 && event.target === this.quickDialog) {
+        this.closeDialogAnimated(this.quickDialog);
+      }
+    });
     this.quickDialog.addEventListener("cancel", (event) => {
       event.preventDefault();
       this.closeDialogAnimated(this.quickDialog);
@@ -614,14 +630,23 @@ class NullPointerApp {
 
     element.hidden = false;
     const contentHeight = element.scrollHeight;
-    const startHeight = interruptedHeight ?? (expanding ? 0 : contentHeight);
-    const endHeight = expanding ? contentHeight : 0;
-    const fileCount = element.getElementsByClassName("scm-file-row").length;
+    // Animating the full height of a large repository forces WebView to
+    // relayout thousands of pixels on every frame. Animate only the visible
+    // portion; the remaining off-screen content is restored after settling.
+    const animatedHeight = Math.min(
+      contentHeight,
+      Math.max(240, Math.min(window.innerHeight * 0.55, 520)),
+    );
+    const startHeight =
+      interruptedHeight === null
+        ? expanding
+          ? 0
+          : animatedHeight
+        : Math.min(interruptedHeight, animatedHeight);
+    const endHeight = expanding ? animatedHeight : 0;
     const skipAnimation =
       this.prefersReducedMotion() ||
       !element.isConnected ||
-      fileCount > 18 ||
-      contentHeight > 640 ||
       Math.abs(endHeight - startHeight) < 1;
 
     if (skipAnimation) {
@@ -640,7 +665,7 @@ class NullPointerApp {
           : 1;
     const distanceRatio = Math.min(
       1,
-      Math.abs(endHeight - startHeight) / Math.max(contentHeight, 1),
+      Math.abs(endHeight - startHeight) / Math.max(animatedHeight, 1),
     );
     const duration = Math.round(
       Math.max(70, (expanding ? 155 : 125) * distanceRatio),
@@ -1522,6 +1547,18 @@ class NullPointerApp {
     }
   }
 
+  private handleTabAuxClick(event: MouseEvent): void {
+    if (event.button !== 1) return;
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const path = target.closest<HTMLButtonElement>(".tab")?.dataset.path;
+    if (!path) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    this.closeTab(path);
+  }
+
   private closeTab(path: string): void {
     if (this.dirty.has(path) && !window.confirm(`Discard unsaved changes in ${basename(path)}?`)) {
       return;
@@ -1946,7 +1983,7 @@ element<HTMLElement>("#app").innerHTML = `
 
     <aside class="activitybar" aria-label="Activity bar">
       <button class="activity-button active" id="activity-explorer" type="button" title="Explorer" aria-label="Explorer">
-        ${icon("panel-left", 23)}
+        ${icon("files", 23)}
       </button>
       <button class="activity-button" id="activity-search" type="button" title="Quick open" aria-label="Quick open">
         ${icon("search", 23)}
