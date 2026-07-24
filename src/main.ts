@@ -90,6 +90,8 @@ class NullPointerApp {
   private readonly commitMessages = new Map<string, string>();
   private readonly dirty = new Set<string>();
   private readonly loadingFiles = new Set<string>();
+  private readonly disclosureAnimations = new WeakMap<HTMLElement, Animation>();
+  private readonly viewAnimations = new WeakMap<HTMLElement, Animation>();
   private sidebarView: "explorer" | "source-control" = "explorer";
   private graphRepository: string | null = null;
   private graphCollapsed = false;
@@ -100,6 +102,7 @@ class NullPointerApp {
   private createKind: CreateKind = "file";
   private busyCount = 0;
   private projectGeneration = 0;
+  private readonly treeAnimationGenerations = new Map<string, number>();
 
   constructor() {
     this.editor = new EditorController(this.editorHost, {
@@ -140,7 +143,9 @@ class NullPointerApp {
     });
     element<HTMLButtonElement>("#activity-source-control").addEventListener("click", () => {
       this.showSidebarView("source-control");
-      void this.refreshGit();
+      if (!this.gitWorkspace && !this.gitLoading) {
+        void this.refreshGit();
+      }
     });
     element<HTMLButtonElement>("#activity-search").addEventListener("click", () => {
       this.showQuickOpen();
@@ -154,7 +159,7 @@ class NullPointerApp {
     this.scmRefreshButton.addEventListener("click", () => void this.refreshGit());
     this.scmGraphToggle.addEventListener("click", () => {
       this.graphCollapsed = !this.graphCollapsed;
-      this.renderGitGraph();
+      this.syncGraphCollapsed();
     });
     this.scmGraphRepository.addEventListener("change", () => {
       this.graphRepository = this.scmGraphRepository.value;
@@ -172,12 +177,20 @@ class NullPointerApp {
     this.quickInput.addEventListener("input", () => this.renderQuickResults());
     this.quickInput.addEventListener("keydown", (event) => this.handleQuickKeydown(event));
     this.quickResults.addEventListener("click", (event) => this.handleQuickClick(event));
+    this.quickDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      this.closeDialogAnimated(this.quickDialog);
+    });
+    this.entryDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      this.closeDialogAnimated(this.entryDialog);
+    });
     this.entryForm.addEventListener("submit", (event) => void this.handleEntrySubmit(event));
     element<HTMLButtonElement>("#entry-cancel").addEventListener("click", () => {
-      this.entryDialog.close();
+      this.closeDialogAnimated(this.entryDialog);
     });
     element<HTMLButtonElement>("#entry-cancel-secondary").addEventListener("click", () => {
-      this.entryDialog.close();
+      this.closeDialogAnimated(this.entryDialog);
     });
     document.querySelectorAll<HTMLButtonElement>("[data-entry-kind]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -217,6 +230,7 @@ class NullPointerApp {
       this.editor.reset();
       this.dirty.clear();
       this.expanded.clear();
+      this.treeAnimationGenerations.clear();
       this.projectName.textContent = snapshot.name;
       this.projectPath.textContent = snapshot.rootPath;
       this.projectPath.title = snapshot.rootPath;
@@ -314,15 +328,8 @@ class NullPointerApp {
   private renderGitGraph(): void {
     const repositories = this.gitWorkspace?.repositories ?? [];
     this.scmView.classList.toggle("graph-hidden", repositories.length === 0);
-    this.scmView.classList.toggle(
-      "graph-collapsed",
-      repositories.length > 0 && this.graphCollapsed,
-    );
     this.scmGraph.classList.toggle("hidden", repositories.length === 0);
-    this.scmGraph.classList.toggle("collapsed", this.graphCollapsed);
-    this.scmGraphToggle.setAttribute("aria-expanded", String(!this.graphCollapsed));
-    this.scmGraphToggle.innerHTML =
-      `${icon(this.graphCollapsed ? "chevron-right" : "chevron-down", 14)}<strong>Graph</strong>`;
+    this.syncGraphCollapsed();
     this.scmGraphBody.replaceChildren();
     this.scmGraphRepository.replaceChildren();
     if (repositories.length === 0) return;
@@ -404,6 +411,154 @@ class NullPointerApp {
     this.scmGraphBody.append(fragment);
   }
 
+  private syncGraphCollapsed(): void {
+    const hasGraph = (this.gitWorkspace?.repositories.length ?? 0) > 0;
+    this.scmView.classList.toggle("graph-collapsed", hasGraph && this.graphCollapsed);
+    this.scmGraph.classList.toggle("collapsed", this.graphCollapsed);
+    this.scmGraphToggle.setAttribute("aria-expanded", String(!this.graphCollapsed));
+  }
+
+  private prefersReducedMotion(): boolean {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+
+  private animateDisclosure(element: HTMLElement, expanding: boolean): void {
+    const previous = this.disclosureAnimations.get(element);
+    const interruptedHeight = previous ? element.getBoundingClientRect().height : null;
+    const interruptedStyle = previous ? getComputedStyle(element) : null;
+    const interruptedOpacity = interruptedStyle
+      ? Number.parseFloat(interruptedStyle.opacity)
+      : null;
+    const interruptedTransform = interruptedStyle?.transform ?? null;
+    if (previous) {
+      this.disclosureAnimations.delete(element);
+      previous.cancel();
+    }
+
+    element.hidden = false;
+    const contentHeight = element.scrollHeight;
+    const startHeight = interruptedHeight ?? (expanding ? 0 : contentHeight);
+    const endHeight = expanding ? contentHeight : 0;
+    const fileCount = element.querySelectorAll(".scm-file-row").length;
+    const skipAnimation =
+      this.prefersReducedMotion() ||
+      !element.isConnected ||
+      fileCount > 18 ||
+      contentHeight > 640 ||
+      Math.abs(endHeight - startHeight) < 1;
+
+    if (skipAnimation) {
+      element.style.removeProperty("overflow");
+      element.style.removeProperty("will-change");
+      element.hidden = !expanding;
+      return;
+    }
+
+    const startOpacity =
+      interruptedOpacity !== null && Number.isFinite(interruptedOpacity)
+        ? interruptedOpacity
+        : expanding
+          ? 0
+          : 1;
+    const startTransform =
+      interruptedTransform && interruptedTransform !== "none"
+        ? interruptedTransform
+        : expanding
+          ? "translateY(-4px)"
+          : "translateY(0)";
+    const distanceRatio = Math.min(
+      1,
+      Math.abs(endHeight - startHeight) / Math.max(contentHeight, 1),
+    );
+    const duration = Math.round(
+      Math.max(70, (expanding ? 155 : 125) * distanceRatio),
+    );
+    element.style.overflow = "hidden";
+    element.style.willChange = "height, opacity, transform";
+    const animation = element.animate(
+      [
+        {
+          height: `${startHeight}px`,
+          opacity: startOpacity,
+          transform: startTransform,
+        },
+        {
+          height: `${endHeight}px`,
+          opacity: expanding ? 1 : 0,
+          transform: expanding ? "translateY(0)" : "translateY(-4px)",
+        },
+      ],
+      {
+        duration,
+        easing: "cubic-bezier(.2,.8,.2,1)",
+        fill: "both",
+      },
+    );
+    this.disclosureAnimations.set(element, animation);
+    const finish = (): void => {
+      if (this.disclosureAnimations.get(element) !== animation) return;
+      this.disclosureAnimations.delete(element);
+      element.hidden = !expanding;
+      animation.cancel();
+      element.style.removeProperty("overflow");
+      element.style.removeProperty("will-change");
+    };
+    animation.onfinish = finish;
+    animation.oncancel = () => {
+      if (this.disclosureAnimations.get(element) !== animation) return;
+      this.disclosureAnimations.delete(element);
+      element.style.removeProperty("overflow");
+      element.style.removeProperty("will-change");
+      element.hidden = !expanding;
+    };
+  }
+
+  private animateViewEntrance(element: HTMLElement, direction: -1 | 1): void {
+    if (this.prefersReducedMotion()) return;
+    const previous = this.viewAnimations.get(element);
+    if (previous) {
+      this.viewAnimations.delete(element);
+      previous.cancel();
+    }
+    const animation = element.animate(
+      [
+        { opacity: 0, transform: `translateX(${direction * 8}px)` },
+        { opacity: 1, transform: "translateX(0)" },
+      ],
+      {
+        duration: 165,
+        easing: "cubic-bezier(.2,.8,.2,1)",
+      },
+    );
+    this.viewAnimations.set(element, animation);
+    const release = (): void => {
+      if (this.viewAnimations.get(element) === animation) {
+        this.viewAnimations.delete(element);
+      }
+    };
+    animation.onfinish = release;
+    animation.oncancel = release;
+  }
+
+  private closeDialogAnimated(dialog: HTMLDialogElement): void {
+    if (!dialog.open || dialog.classList.contains("closing")) return;
+    if (this.prefersReducedMotion()) {
+      dialog.close();
+      return;
+    }
+
+    dialog.classList.add("closing");
+    let completed = false;
+    const finish = (): void => {
+      if (completed) return;
+      completed = true;
+      if (dialog.open) dialog.close();
+      dialog.classList.remove("closing");
+    };
+    dialog.addEventListener("animationend", finish, { once: true });
+    window.setTimeout(finish, 180);
+  }
+
   private renderCommitLanes(
     currentLanes: readonly string[],
     nextLanes: readonly string[],
@@ -463,15 +618,17 @@ class NullPointerApp {
     section.dataset.repository = repository.relativePath;
 
     const collapsed = this.collapsedRepositories.has(repository.relativePath);
+    section.classList.toggle("collapsed", collapsed);
     const header = document.createElement("button");
     header.type = "button";
     header.className = "scm-repo-header";
     header.dataset.repositoryToggle = repository.relativePath;
+    header.setAttribute("aria-expanded", String(!collapsed));
     header.title = repository.relativePath === "." ? repository.name : repository.relativePath;
 
     const marker = document.createElement("span");
     marker.className = "scm-repo-marker";
-    marker.innerHTML = icon(collapsed ? "chevron-right" : "chevron-down", 15);
+    marker.innerHTML = icon("chevron-down", 15);
     const repositoryIcon = document.createElement("span");
     repositoryIcon.className = "scm-repo-icon";
     repositoryIcon.innerHTML = icon("git-branch", 17);
@@ -648,9 +805,15 @@ class NullPointerApp {
     const toggle = target.closest<HTMLButtonElement>("[data-repository-toggle]");
     if (toggle?.dataset.repositoryToggle) {
       const repository = toggle.dataset.repositoryToggle;
-      if (this.collapsedRepositories.has(repository)) this.collapsedRepositories.delete(repository);
+      const section = toggle.closest<HTMLElement>(".scm-repository");
+      const body = section?.querySelector<HTMLElement>(".scm-repo-body");
+      if (!section || !body) return;
+      const expanding = this.collapsedRepositories.has(repository);
+      if (expanding) this.collapsedRepositories.delete(repository);
       else this.collapsedRepositories.add(repository);
-      this.renderGit();
+      section.classList.toggle("collapsed", !expanding);
+      toggle.setAttribute("aria-expanded", String(expanding));
+      this.animateDisclosure(body, expanding);
       return;
     }
 
@@ -758,6 +921,7 @@ class NullPointerApp {
         row.className = "tree-row";
         row.dataset.path = entry.path;
         row.dataset.kind = entry.kind;
+        row.dataset.depth = String(depth);
         row.style.setProperty("--tree-depth", String(depth));
         row.title = entry.path;
         if (entry.path === this.editor.active) row.classList.add("active");
@@ -806,12 +970,98 @@ class NullPointerApp {
     if (!row || !path) return;
 
     if (row.dataset.kind === "directory") {
-      if (this.expanded.has(path)) this.expanded.delete(path);
-      else this.expanded.add(path);
-      this.renderTree();
+      void this.toggleDirectory(row, path);
       return;
     }
     void this.openFile(path);
+  }
+
+  private async toggleDirectory(row: HTMLButtonElement, path: string): Promise<void> {
+    const generation = (this.treeAnimationGenerations.get(path) ?? 0) + 1;
+    this.treeAnimationGenerations.set(path, generation);
+    const expanding = !this.expanded.has(path);
+    if (!expanding) {
+      // Update the logical state before waiting so a rapid second click reverses
+      // the transition instead of queueing another collapse.
+      this.expanded.delete(path);
+      const descendants = this.treeDescendantRows(row);
+      const marker = row.querySelector<HTMLElement>(".tree-marker");
+      if (!this.prefersReducedMotion()) {
+        marker?.animate(
+          [{ transform: "rotate(0)" }, { transform: "rotate(-90deg)" }],
+          { duration: 130, easing: "cubic-bezier(.2,.8,.2,1)" },
+        );
+        const animations = descendants.slice(0, 40).map((descendant, index) =>
+          descendant.animate(
+            [
+              { opacity: 1, transform: "translateY(0)" },
+              { opacity: 0, transform: "translateY(-4px)" },
+            ],
+            {
+              duration: 115,
+              delay: Math.min(index * 4, 45),
+              easing: "cubic-bezier(.4,0,1,1)",
+            },
+          ).finished.catch(() => undefined),
+        );
+        await Promise.race([
+          Promise.all(animations),
+          new Promise<void>((resolve) => window.setTimeout(resolve, 200)),
+        ]);
+      }
+      if (generation !== this.treeAnimationGenerations.get(path)) return;
+      this.treeAnimationGenerations.delete(path);
+      this.renderTree();
+      return;
+    }
+
+    this.expanded.add(path);
+    this.renderTree();
+    if (this.prefersReducedMotion() || generation !== this.treeAnimationGenerations.get(path)) {
+      if (generation === this.treeAnimationGenerations.get(path)) {
+        this.treeAnimationGenerations.delete(path);
+      }
+      return;
+    }
+    this.treeAnimationGenerations.delete(path);
+    const expandedRow = this.tree.querySelector<HTMLButtonElement>(
+      `.tree-row[data-path="${escapeSelector(path)}"]`,
+    );
+    if (!expandedRow) return;
+    expandedRow.querySelector<HTMLElement>(".tree-marker")?.animate(
+      [{ transform: "rotate(-90deg)" }, { transform: "rotate(0)" }],
+      { duration: 150, easing: "cubic-bezier(.2,.8,.2,1)" },
+    );
+    for (const [index, descendant] of this.treeDescendantRows(expandedRow).slice(0, 40).entries()) {
+      descendant.animate(
+        [
+          { opacity: 0, transform: "translateY(-5px)" },
+          { opacity: 1, transform: "translateY(0)" },
+        ],
+        {
+          duration: 150,
+          delay: Math.min(index * 7, 70),
+          easing: "cubic-bezier(.2,.8,.2,1)",
+        },
+      );
+    }
+  }
+
+  private treeDescendantRows(row: HTMLButtonElement): HTMLButtonElement[] {
+    const rows = Array.from(this.tree.querySelectorAll<HTMLButtonElement>(".tree-row"));
+    const start = rows.indexOf(row);
+    const depth = Number(row.dataset.depth);
+    if (start < 0 || !Number.isFinite(depth)) return [];
+
+    const descendants: HTMLButtonElement[] = [];
+    for (let index = start + 1; index < rows.length; index += 1) {
+      const candidate = rows[index];
+      if (!candidate) continue;
+      const candidateDepth = Number(candidate.dataset.depth);
+      if (candidateDepth <= depth) break;
+      descendants.push(candidate);
+    }
+    return descendants;
   }
 
   private async openFile(path: string): Promise<void> {
@@ -961,9 +1211,15 @@ class NullPointerApp {
       this.toast("Open a project folder first", "neutral");
       return;
     }
+    if (this.quickDialog.open) {
+      this.quickInput.focus();
+      this.quickInput.select();
+      return;
+    }
     this.quickInput.value = "";
     this.quickSelection = 0;
     this.renderQuickResults();
+    this.quickDialog.classList.remove("closing");
     this.quickDialog.showModal();
     requestAnimationFrame(() => this.quickInput.focus());
   }
@@ -1015,7 +1271,7 @@ class NullPointerApp {
       event.preventDefault();
       const match = this.quickMatches[this.quickSelection];
       if (match) {
-        this.quickDialog.close();
+        this.closeDialogAnimated(this.quickDialog);
         void this.openFile(match.path);
       }
     }
@@ -1027,17 +1283,22 @@ class NullPointerApp {
     const row = target.closest<HTMLButtonElement>("[data-quick-path]");
     const path = row?.dataset.quickPath;
     if (path) {
-      this.quickDialog.close();
+      this.closeDialogAnimated(this.quickDialog);
       void this.openFile(path);
     }
   }
 
   private showEntryDialog(): void {
     if (!this.project) return;
+    if (this.entryDialog.open) {
+      this.entryInput.focus();
+      return;
+    }
     this.entryInput.value = "";
     this.entryError.textContent = "";
     this.createKind = "file";
     this.syncEntryKindButtons();
+    this.entryDialog.classList.remove("closing");
     this.entryDialog.showModal();
     requestAnimationFrame(() => this.entryInput.focus());
   }
@@ -1072,7 +1333,7 @@ class NullPointerApp {
           this.expanded.add(current);
         }
       }
-      this.entryDialog.close();
+      this.closeDialogAnimated(this.entryDialog);
       this.renderTree();
       this.toast(`${this.createKind === "file" ? "Created" : "Created folder"} ${path}`, "success");
       if (this.createKind === "file") await this.openFile(path);
@@ -1109,6 +1370,7 @@ class NullPointerApp {
   }
 
   private showSidebarView(view: "explorer" | "source-control"): void {
+    const viewChanged = this.sidebarView !== view;
     this.sidebarView = view;
     if (this.sidebarCollapsed) {
       this.sidebarCollapsed = false;
@@ -1121,6 +1383,14 @@ class NullPointerApp {
     this.scmView.classList.toggle("hidden", !sourceControl);
     this.scmActions.classList.toggle("hidden", !sourceControl);
     this.syncSidebarActivity();
+    if (viewChanged) {
+      this.animateViewEntrance(sourceControl ? this.scmView : this.explorerView, sourceControl ? 1 : -1);
+      this.animateViewEntrance(
+        sourceControl ? this.scmActions : this.explorerActions,
+        sourceControl ? 1 : -1,
+      );
+      this.animateViewEntrance(this.sidebarTitle, sourceControl ? 1 : -1);
+    }
   }
 
   private toggleSidebar(): void {
