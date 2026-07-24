@@ -1,3 +1,4 @@
+import "@fontsource-variable/inter";
 import "./styles/main.css";
 import { EditorController } from "./editor/controller";
 import {

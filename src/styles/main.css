@@ -1,9 +1,10 @@
 :root {
   color-scheme: dark;
-  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-ui: "Inter Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "Liberation Mono", monospace;
   font-family: var(--font-ui);
-  font-synthesis: weight;
+  font-feature-settings: "cv02" 1, "cv03" 1, "cv04" 1, "cv11" 1;
+  font-synthesis: none;
   font-optical-sizing: auto;
   text-rendering: auto;
   --radius-sm: 7px;
