@@ -84,6 +84,11 @@ input:focus-visible {
   transition: grid-template-columns var(--motion-base) var(--motion-ease);
 }
 
+.shell.resizing {
+  transition: none;
+  user-select: none;
+}
+
 .progress {
   position: fixed;
   z-index: 100;
@@ -823,24 +828,133 @@ kbd {
 }
 
 .scm-graph-repository {
+  position: relative;
+  flex: 1 1 auto;
   min-width: 0;
-  max-width: 190px;
+  margin-left: 6px;
+}
+
+.scm-graph-repository-trigger {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  width: 100%;
   height: 28px;
-  margin-left: auto;
-  padding: 0 24px 0 8px;
+  padding: 0 6px 0 9px;
   border: 1px solid #292929;
   border-radius: 8px;
   outline: 0;
-  color: #c5c5c5;
-  background: #080808;
+  overflow: hidden;
+  color: #d5d5d5;
+  background: #090909;
   font-family: var(--font-mono);
   font-size: 14px;
-  text-overflow: ellipsis;
   cursor: pointer;
+  text-align: left;
 }
 
-.scm-graph-repository:focus { border-color: #666; }
-.scm-graph-repository option { color: #ccc; background: #080808; }
+.scm-graph-repository-trigger:hover { border-color: #3a3a3a; background: #0d0d0d; }
+.scm-graph-repository-trigger:focus-visible { border-color: #666; outline: 0; }
+.scm-graph-repository-trigger > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scm-graph-repository-trigger svg {
+  justify-self: end;
+  color: #a0a0a0;
+  transition: transform var(--motion-fast) var(--motion-ease);
+}
+
+.scm-graph-repository:has(.scm-graph-repository-menu:popover-open)
+  .scm-graph-repository-trigger svg {
+  transform: rotate(180deg);
+}
+
+.scm-graph-repository-menu {
+  position: fixed;
+  inset: auto;
+  z-index: 500;
+  margin: 0;
+  padding: 4px;
+  border: 1px solid #292929;
+  border-radius: 9px;
+  overflow: auto;
+  opacity: 0;
+  color: #d8d8d8;
+  background: #090909;
+  box-shadow: 0 12px 30px #000b;
+  transform: translateY(-5px) scale(.985);
+  transform-origin: top center;
+  transition:
+    opacity var(--motion-fast) ease,
+    transform var(--motion-fast) var(--motion-ease),
+    display var(--motion-fast) allow-discrete,
+    overlay var(--motion-fast) allow-discrete;
+}
+
+.scm-graph-repository-menu:popover-open {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+@starting-style {
+  .scm-graph-repository-menu:popover-open {
+    opacity: 0;
+    transform: translateY(-5px) scale(.985);
+  }
+}
+
+.scm-graph-repository-menu::backdrop { background: transparent; }
+
+.scm-graph-repository-option {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 18px;
+  align-items: center;
+  width: 100%;
+  height: 31px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  overflow: hidden;
+  color: #bdbdbd;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-align: left;
+}
+
+.scm-graph-repository-option:hover,
+.scm-graph-repository-option:focus-visible {
+  outline: 0;
+  color: #f1f1f1;
+  background: #171717;
+}
+
+.scm-graph-repository-option.active {
+  color: #fff;
+  background: #121212;
+}
+
+.scm-graph-repository-option > span:nth-child(2) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scm-graph-repository-option-icon {
+  display: grid;
+  place-items: center;
+  color: #888;
+}
+
+.scm-graph-repository-option.active .scm-graph-repository-option-icon,
+.scm-graph-repository-option-check { color: #d6d6d6; }
+.scm-graph-repository-option-check { display: grid; place-items: center; }
 
 .scm-graph-body {
   min-height: 0;

@@ -46,8 +46,6 @@ const GIT_COMMIT_OPTIONS: readonly {
   { action: "commit-sync", label: "Commit & Sync" },
 ];
 const ACTIVITYBAR_WIDTH = 56;
-const MIN_SIDEBAR_WIDTH = 320;
-const MAX_SIDEBAR_WIDTH = 640;
 
 function element<T extends HTMLElement>(selector: string): T {
   const value = document.querySelector<T>(selector);
@@ -71,7 +69,15 @@ class NullPointerApp {
   private readonly scmRepositories = element<HTMLElement>("#scm-repositories");
   private readonly scmGraph = element<HTMLElement>("#scm-graph");
   private readonly scmGraphBody = element<HTMLElement>("#scm-graph-body");
-  private readonly scmGraphRepository = element<HTMLSelectElement>("#scm-graph-repository");
+  private readonly scmGraphRepositoryTrigger = element<HTMLButtonElement>(
+    "#scm-graph-repository-trigger",
+  );
+  private readonly scmGraphRepositoryLabel = element<HTMLElement>(
+    "#scm-graph-repository-label",
+  );
+  private readonly scmGraphRepositoryMenu = element<HTMLElement>(
+    "#scm-graph-repository-menu",
+  );
   private readonly scmGraphToggle = element<HTMLButtonElement>("#scm-graph-toggle");
   private readonly scmRefreshButton = element<HTMLButtonElement>("#scm-refresh-button");
   private readonly scmBadge = element<HTMLElement>("#scm-badge");
@@ -176,10 +182,36 @@ class NullPointerApp {
       this.graphCollapsed = !this.graphCollapsed;
       this.syncGraphCollapsed();
     });
-    this.scmGraphRepository.addEventListener("change", () => {
-      this.graphRepository = this.scmGraphRepository.value;
-      this.renderGitGraph();
+    this.scmGraphRepositoryTrigger.addEventListener("click", () => {
+      this.toggleGraphRepositoryMenu();
     });
+    this.scmGraphRepositoryMenu.addEventListener("click", (event) => {
+      this.handleGraphRepositoryClick(event);
+    });
+    this.scmGraphRepositoryMenu.addEventListener("toggle", () => {
+      this.scmGraphRepositoryTrigger.setAttribute(
+        "aria-expanded",
+        String(this.scmGraphRepositoryMenu.matches(":popover-open")),
+      );
+    });
+    this.scmGraphRepositoryMenu.addEventListener("keydown", (event) => {
+      this.handleGraphRepositoryKeydown(event);
+    });
+    document.addEventListener(
+      "pointerdown",
+      (event) => {
+        if (!this.scmGraphRepositoryMenu.matches(":popover-open")) return;
+        const target = event.target;
+        if (
+          target instanceof Node &&
+          !this.scmGraphRepositoryMenu.contains(target) &&
+          !this.scmGraphRepositoryTrigger.contains(target)
+        ) {
+          this.scmGraphRepositoryMenu.hidePopover();
+        }
+      },
+      { capture: true },
+    );
     this.scmRepositories.addEventListener("click", (event) => {
       void this.handleGitClick(event);
     });
@@ -347,7 +379,7 @@ class NullPointerApp {
     this.scmGraph.classList.toggle("hidden", repositories.length === 0);
     this.syncGraphCollapsed();
     this.scmGraphBody.replaceChildren();
-    this.scmGraphRepository.replaceChildren();
+    this.scmGraphRepositoryMenu.replaceChildren();
     if (repositories.length === 0) return;
 
     const selected =
@@ -355,14 +387,37 @@ class NullPointerApp {
       repositories[0];
     if (!selected) return;
     this.graphRepository = selected.relativePath;
+    this.scmGraphRepositoryLabel.textContent = selected.name;
+    this.scmGraphRepositoryLabel.title = selected.relativePath;
+    this.scmGraphRepositoryTrigger.setAttribute(
+      "aria-label",
+      `Graph repository: ${selected.name}`,
+    );
 
     for (const repository of repositories) {
-      const option = document.createElement("option");
-      option.value = repository.relativePath;
-      option.textContent = repository.name;
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "scm-graph-repository-option";
+      option.classList.toggle("active", repository.relativePath === selected.relativePath);
+      option.dataset.graphRepository = repository.relativePath;
       option.title = repository.relativePath;
-      option.selected = repository.relativePath === selected.relativePath;
-      this.scmGraphRepository.append(option);
+      option.setAttribute("role", "option");
+      option.setAttribute(
+        "aria-selected",
+        String(repository.relativePath === selected.relativePath),
+      );
+      const repositoryIcon = document.createElement("span");
+      repositoryIcon.className = "scm-graph-repository-option-icon";
+      repositoryIcon.innerHTML = icon("git-branch", 14);
+      const name = document.createElement("span");
+      name.textContent = repository.name;
+      const selectedMarker = document.createElement("span");
+      selectedMarker.className = "scm-graph-repository-option-check";
+      if (repository.relativePath === selected.relativePath) {
+        selectedMarker.innerHTML = icon("check", 14);
+      }
+      option.append(repositoryIcon, name, selectedMarker);
+      this.scmGraphRepositoryMenu.append(option);
     }
 
     if (selected.commits.length === 0) {
@@ -425,6 +480,94 @@ class NullPointerApp {
     this.scmView.classList.toggle("graph-collapsed", hasGraph && this.graphCollapsed);
     this.scmGraph.classList.toggle("collapsed", this.graphCollapsed);
     this.scmGraphToggle.setAttribute("aria-expanded", String(!this.graphCollapsed));
+  }
+
+  private toggleGraphRepositoryMenu(): void {
+    if (this.scmGraphRepositoryMenu.matches(":popover-open")) {
+      this.scmGraphRepositoryMenu.hidePopover();
+      return;
+    }
+    this.openAnchoredPopover(
+      this.scmGraphRepositoryMenu,
+      this.scmGraphRepositoryTrigger,
+      "start",
+      true,
+    );
+    this.scmGraphRepositoryMenu
+      .querySelector<HTMLButtonElement>(".scm-graph-repository-option.active")
+      ?.focus({ preventScroll: true });
+  }
+
+  private handleGraphRepositoryClick(event: MouseEvent): void {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const option = target.closest<HTMLButtonElement>("[data-graph-repository]");
+    if (!option?.dataset.graphRepository) return;
+    this.scmGraphRepositoryMenu.hidePopover();
+    if (this.graphRepository === option.dataset.graphRepository) return;
+    this.graphRepository = option.dataset.graphRepository;
+    this.renderGitGraph();
+  }
+
+  private handleGraphRepositoryKeydown(event: KeyboardEvent): void {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    const options = [
+      ...this.scmGraphRepositoryMenu.querySelectorAll<HTMLButtonElement>(
+        ".scm-graph-repository-option",
+      ),
+    ];
+    if (options.length === 0) return;
+    event.preventDefault();
+    const current = options.indexOf(document.activeElement as HTMLButtonElement);
+    let next = 0;
+    if (event.key === "End") next = options.length - 1;
+    else if (event.key === "ArrowUp") next = current <= 0 ? options.length - 1 : current - 1;
+    else if (event.key === "ArrowDown") next = current >= options.length - 1 ? 0 : current + 1;
+    options[next]?.focus({ preventScroll: true });
+  }
+
+  private selectGraphRepositoryFromInteraction(repositoryPath: string): void {
+    if (
+      this.graphRepository === repositoryPath ||
+      !this.gitWorkspace?.repositories.some(
+        (repository) => repository.relativePath === repositoryPath,
+      )
+    ) {
+      return;
+    }
+    this.graphRepository = repositoryPath;
+    this.renderGitGraph();
+  }
+
+  private openAnchoredPopover(
+    menu: HTMLElement,
+    anchor: HTMLElement,
+    alignment: "start" | "end",
+    matchAnchorWidth = false,
+  ): void {
+    const anchorRect = anchor.getBoundingClientRect();
+    menu.style.visibility = "hidden";
+    menu.style.left = "0";
+    menu.style.top = "0";
+    menu.style.maxHeight = `${Math.max(80, window.innerHeight - 16)}px`;
+    if (matchAnchorWidth) menu.style.width = `${Math.round(anchorRect.width)}px`;
+    else menu.style.removeProperty("width");
+    if (!menu.matches(":popover-open")) menu.showPopover();
+    const menuRect = menu.getBoundingClientRect();
+    const preferredLeft =
+      alignment === "start" ? anchorRect.left : anchorRect.right - menuRect.width;
+    const left = Math.max(
+      8,
+      Math.min(preferredLeft, window.innerWidth - menuRect.width - 8),
+    );
+    const below = anchorRect.bottom + 5;
+    const top =
+      below + menuRect.height <= window.innerHeight - 8
+        ? below
+        : Math.max(8, anchorRect.top - menuRect.height - 5);
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+    menu.style.removeProperty("visibility");
   }
 
   private prefersReducedMotion(): boolean {
@@ -953,6 +1096,10 @@ class NullPointerApp {
   private async handleGitClick(event: MouseEvent): Promise<void> {
     const target = event.target;
     if (!(target instanceof Element)) return;
+    const interactedRepository = target.closest<HTMLElement>(".scm-repository")?.dataset.repository;
+    if (interactedRepository) {
+      this.selectGraphRepositoryFromInteraction(interactedRepository);
+    }
     const commitMenuToggle = target.closest<HTMLButtonElement>("[data-commit-menu-target]");
     if (commitMenuToggle?.dataset.commitMenuTarget) {
       const menu = document.getElementById(commitMenuToggle.dataset.commitMenuTarget);
@@ -961,24 +1108,7 @@ class NullPointerApp {
         menu.hidePopover();
         return;
       }
-      menu.style.visibility = "hidden";
-      menu.style.left = "0";
-      menu.style.top = "0";
-      menu.showPopover();
-      const toggleRect = commitMenuToggle.getBoundingClientRect();
-      const menuRect = menu.getBoundingClientRect();
-      const left = Math.max(
-        8,
-        Math.min(toggleRect.right - menuRect.width, window.innerWidth - menuRect.width - 8),
-      );
-      const below = toggleRect.bottom + 5;
-      const top =
-        below + menuRect.height <= window.innerHeight - 8
-          ? below
-          : Math.max(8, toggleRect.top - menuRect.height - 5);
-      menu.style.left = `${Math.round(left)}px`;
-      menu.style.top = `${Math.round(top)}px`;
-      menu.style.removeProperty("visibility");
+      this.openAnchoredPopover(menu, commitMenuToggle, "end");
       return;
     }
 
@@ -1725,31 +1855,48 @@ class NullPointerApp {
     const resizer = element<HTMLElement>("#sidebar-resizer");
     resizer.addEventListener("pointerdown", (event) => {
       if (this.sidebarCollapsed) return;
+      event.preventDefault();
       resizer.setPointerCapture(event.pointerId);
+      this.shell.classList.add("resizing");
       const onMove = (moveEvent: PointerEvent): void => {
-        const width = Math.min(
-          MAX_SIDEBAR_WIDTH,
-          Math.max(MIN_SIDEBAR_WIDTH, moveEvent.clientX - ACTIVITYBAR_WIDTH),
+        const width = Math.max(
+          0,
+          Math.min(
+            moveEvent.clientX - ACTIVITYBAR_WIDTH,
+            window.innerWidth - ACTIVITYBAR_WIDTH,
+          ),
         );
         this.shell.style.setProperty("--sidebar-width", `${width}px`);
+        if (this.scmGraphRepositoryMenu.matches(":popover-open")) {
+          this.openAnchoredPopover(
+            this.scmGraphRepositoryMenu,
+            this.scmGraphRepositoryTrigger,
+            "start",
+            true,
+          );
+        }
       };
       const onEnd = (): void => {
         resizer.removeEventListener("pointermove", onMove);
+        resizer.removeEventListener("pointerup", onEnd);
+        resizer.removeEventListener("pointercancel", onEnd);
+        this.shell.classList.remove("resizing");
         const width = getComputedStyle(this.shell).getPropertyValue("--sidebar-width").trim();
         this.writeStorage(SIDEBAR_WIDTH_KEY, width);
       };
       resizer.addEventListener("pointermove", onMove);
-      resizer.addEventListener("pointerup", onEnd, { once: true });
-      resizer.addEventListener("pointercancel", onEnd, { once: true });
+      resizer.addEventListener("pointerup", onEnd);
+      resizer.addEventListener("pointercancel", onEnd);
     });
   }
 
   private restoreSidebarWidth(): void {
     const stored = this.readStorage(SIDEBAR_WIDTH_KEY);
-    const match = stored?.match(/^(\d{3})px$/);
+    const match = stored?.match(/^(\d+)px$/);
     if (!match) return;
     const width = Number(match[1]);
-    const clamped = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
+    if (!Number.isSafeInteger(width) || width < 0) return;
+    const clamped = Math.min(width, Math.max(0, window.innerWidth - ACTIVITYBAR_WIDTH));
     this.shell.style.setProperty("--sidebar-width", `${clamped}px`);
   }
 
@@ -1851,7 +1998,27 @@ element<HTMLElement>("#app").innerHTML = `
             <button class="scm-graph-toggle" id="scm-graph-toggle" type="button" aria-expanded="true">
               ${icon("chevron-down", 14)}<strong>Graph</strong>
             </button>
-            <select class="scm-graph-repository" id="scm-graph-repository" aria-label="Graph repository"></select>
+            <div class="scm-graph-repository" id="scm-graph-repository">
+              <button
+                class="scm-graph-repository-trigger"
+                id="scm-graph-repository-trigger"
+                type="button"
+                aria-haspopup="listbox"
+                aria-controls="scm-graph-repository-menu"
+                aria-expanded="false"
+                aria-label="Graph repository"
+              >
+                <span id="scm-graph-repository-label">Repository</span>
+                ${icon("chevron-down", 14)}
+              </button>
+              <div
+                class="scm-graph-repository-menu"
+                id="scm-graph-repository-menu"
+                popover="manual"
+                role="listbox"
+                aria-label="Graph repository"
+              ></div>
+            </div>
           </header>
           <div class="scm-graph-body" id="scm-graph-body"></div>
         </section>
