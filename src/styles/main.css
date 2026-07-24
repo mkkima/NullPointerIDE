@@ -380,8 +380,20 @@ kbd {
 .tree-row:hover { background: #ffffff0a; color: #ddd; }
 .tree-row.active { color: #fff; background: #ffffff10; }
 .tree-row.loading { opacity: .5; }
-.tree-marker { display: grid; place-items: center; flex: 0 0 17px; width: 17px; color: #8a8a8a; }
-.tree-marker { transform-origin: center; }
+.tree-directory-children {
+  min-width: 0;
+  contain: layout;
+}
+.tree-marker {
+  display: grid;
+  place-items: center;
+  flex: 0 0 17px;
+  width: 17px;
+  color: #8a8a8a;
+  transform-origin: center;
+}
+.tree-row[data-kind="directory"] .tree-marker { transform: rotate(-90deg); }
+.tree-row[data-kind="directory"].expanded .tree-marker { transform: rotate(0); }
 .tree-icon { display: grid; place-items: center; flex: 0 0 24px; width: 24px; color: #8a8a8a; }
 .tree-label { overflow: hidden; text-overflow: ellipsis; }
 .tree-label.symlink { font-style: italic; text-decoration: underline; text-decoration-color: #4c5363; }

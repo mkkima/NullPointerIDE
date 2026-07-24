@@ -1293,7 +1293,11 @@ class NullPointerApp {
     }
 
     const fragment = document.createDocumentFragment();
-    const appendEntries = (entries: readonly FileEntry[], depth: number): void => {
+    const appendEntries = (
+      entries: readonly FileEntry[],
+      depth: number,
+      container: ParentNode,
+    ): void => {
       for (const entry of entries) {
         const row = document.createElement("button");
         row.type = "button";
@@ -1305,11 +1309,14 @@ class NullPointerApp {
         row.title = entry.path;
         if (entry.path === this.editor.active) row.classList.add("active");
         if (this.loadingFiles.has(entry.path)) row.classList.add("loading");
+        if (entry.kind === "directory" && this.expanded.has(entry.path)) {
+          row.classList.add("expanded");
+        }
 
         const marker = document.createElement("span");
         marker.className = "tree-marker";
         if (entry.kind === "directory") {
-          marker.innerHTML = icon(this.expanded.has(entry.path) ? "chevron-down" : "chevron-right", 15);
+          marker.innerHTML = icon("chevron-down", 15);
         }
 
         const glyph = document.createElement("span");
@@ -1322,13 +1329,17 @@ class NullPointerApp {
         if (entry.isSymlink) label.classList.add("symlink");
 
         row.append(marker, glyph, label);
-        fragment.append(row);
+        container.append(row);
         if (entry.kind === "directory" && this.expanded.has(entry.path)) {
-          appendEntries(entry.children, depth + 1);
+          const children = document.createElement("div");
+          children.className = "tree-directory-children";
+          children.dataset.treeParent = entry.path;
+          appendEntries(entry.children, depth + 1, children);
+          container.append(children);
         }
       }
     };
-    appendEntries(this.project.entries, 0);
+    appendEntries(this.project.entries, 0, fragment);
     this.tree.append(fragment);
   }
 
@@ -1349,13 +1360,13 @@ class NullPointerApp {
     if (!row || !path) return;
 
     if (row.dataset.kind === "directory") {
-      void this.toggleDirectory(row, path);
+      this.toggleDirectory(row, path);
       return;
     }
     void this.openFile(path);
   }
 
-  private async toggleDirectory(row: HTMLButtonElement, path: string): Promise<void> {
+  private toggleDirectory(row: HTMLButtonElement, path: string): void {
     const generation = (this.treeAnimationGenerations.get(path) ?? 0) + 1;
     this.treeAnimationGenerations.set(path, generation);
     const expanding = !this.expanded.has(path);
@@ -1363,84 +1374,76 @@ class NullPointerApp {
       // Update the logical state before waiting so a rapid second click reverses
       // the transition instead of queueing another collapse.
       this.expanded.delete(path);
-      const descendants = this.treeDescendantRows(row);
-      const marker = row.querySelector<HTMLElement>(".tree-marker");
-      if (!this.prefersReducedMotion()) {
-        marker?.animate(
-          [{ transform: "rotate(0)" }, { transform: "rotate(-90deg)" }],
-          { duration: 130, easing: "cubic-bezier(.2,.8,.2,1)" },
-        );
-        const animations = descendants.slice(0, 40).map((descendant, index) =>
-          descendant.animate(
-            [
-              { opacity: 1, transform: "translateY(0)" },
-              { opacity: 0, transform: "translateY(-4px)" },
-            ],
-            {
-              duration: 115,
-              delay: Math.min(index * 4, 45),
-              easing: "cubic-bezier(.4,0,1,1)",
-            },
-          ).finished.catch(() => undefined),
-        );
-        await Promise.race([
-          Promise.all(animations),
-          new Promise<void>((resolve) => window.setTimeout(resolve, 200)),
-        ]);
+      const children = row.nextElementSibling;
+      if (
+        !(children instanceof HTMLElement) ||
+        children.dataset.treeParent !== path
+      ) {
+        this.treeAnimationGenerations.delete(path);
+        this.renderTree();
+        this.focusTreeRow(path);
+        return;
       }
-      if (generation !== this.treeAnimationGenerations.get(path)) return;
-      this.treeAnimationGenerations.delete(path);
-      this.renderTree();
+
+      this.animateTreeMarker(row, false);
+      this.animateDisclosure(children, false, () => {
+        if (generation !== this.treeAnimationGenerations.get(path)) return;
+        this.treeAnimationGenerations.delete(path);
+        this.renderTree();
+        this.focusTreeRow(path);
+      });
       return;
     }
 
     this.expanded.add(path);
     this.renderTree();
-    if (this.prefersReducedMotion() || generation !== this.treeAnimationGenerations.get(path)) {
-      if (generation === this.treeAnimationGenerations.get(path)) {
-        this.treeAnimationGenerations.delete(path);
-      }
-      return;
-    }
-    this.treeAnimationGenerations.delete(path);
     const expandedRow = this.tree.querySelector<HTMLButtonElement>(
       `.tree-row[data-path="${escapeSelector(path)}"]`,
     );
-    if (!expandedRow) return;
-    expandedRow.querySelector<HTMLElement>(".tree-marker")?.animate(
-      [{ transform: "rotate(-90deg)" }, { transform: "rotate(0)" }],
-      { duration: 150, easing: "cubic-bezier(.2,.8,.2,1)" },
-    );
-    for (const [index, descendant] of this.treeDescendantRows(expandedRow).slice(0, 40).entries()) {
-      descendant.animate(
-        [
-          { opacity: 0, transform: "translateY(-5px)" },
-          { opacity: 1, transform: "translateY(0)" },
-        ],
-        {
-          duration: 150,
-          delay: Math.min(index * 7, 70),
-          easing: "cubic-bezier(.2,.8,.2,1)",
-        },
-      );
+    const children = expandedRow?.nextElementSibling;
+    if (
+      !expandedRow ||
+      !(children instanceof HTMLElement) ||
+      children.dataset.treeParent !== path
+    ) {
+      this.treeAnimationGenerations.delete(path);
+      return;
     }
+
+    expandedRow.focus({ preventScroll: true });
+    this.animateTreeMarker(expandedRow, true);
+    this.animateDisclosure(children, true, () => {
+      if (generation === this.treeAnimationGenerations.get(path)) {
+        this.treeAnimationGenerations.delete(path);
+      }
+    });
   }
 
-  private treeDescendantRows(row: HTMLButtonElement): HTMLButtonElement[] {
-    const rows = Array.from(this.tree.querySelectorAll<HTMLButtonElement>(".tree-row"));
-    const start = rows.indexOf(row);
-    const depth = Number(row.dataset.depth);
-    if (start < 0 || !Number.isFinite(depth)) return [];
+  private animateTreeMarker(row: HTMLButtonElement, expanding: boolean): void {
+    if (this.prefersReducedMotion()) return;
+    const marker = row.querySelector<HTMLElement>(".tree-marker");
+    if (!marker) return;
 
-    const descendants: HTMLButtonElement[] = [];
-    for (let index = start + 1; index < rows.length; index += 1) {
-      const candidate = rows[index];
-      if (!candidate) continue;
-      const candidateDepth = Number(candidate.dataset.depth);
-      if (candidateDepth <= depth) break;
-      descendants.push(candidate);
-    }
-    return descendants;
+    const animation = marker.animate(
+      [
+        { transform: expanding ? "rotate(-90deg)" : "rotate(0)" },
+        { transform: expanding ? "rotate(0)" : "rotate(-90deg)" },
+      ],
+      {
+        duration: expanding ? 150 : 125,
+        easing: "cubic-bezier(.2,.8,.2,1)",
+        fill: "both",
+      },
+    );
+    animation.onfinish = () => animation.cancel();
+  }
+
+  private focusTreeRow(path: string): void {
+    this.tree
+      .querySelector<HTMLButtonElement>(
+        `.tree-row[data-path="${escapeSelector(path)}"]`,
+      )
+      ?.focus({ preventScroll: true });
   }
 
   private async openFile(path: string): Promise<void> {
