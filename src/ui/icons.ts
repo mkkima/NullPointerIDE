@@ -5,6 +5,7 @@ export type IconName =
   | "file"
   | "file-plus"
   | "files"
+  | "flask"
   | "folder"
   | "folder-open"
   | "folder-plus"
@@ -26,6 +27,7 @@ const paths: Readonly<Record<IconName, string>> = {
   file: '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/>',
   "file-plus": '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/><path d="M12 18v-6M9 15h6"/>',
   files: '<path d="M15 2H6a2 2 0 0 0-2 2v13"/><rect width="11" height="16" x="9" y="6" rx="2"/>',
+  flask: '<path d="M10 2v7.31M14 9.31V2M8.5 2h7"/><path d="M14 9.3a6.5 6.5 0 1 1-4 0M5.52 16h12.96"/>',
   folder: '<path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>',
   "folder-open": '<path d="m6 14 1.5-4h13l-2 8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v2"/>',
   "folder-plus": '<path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M12 10v6M9 13h6"/>',

@@ -3,18 +3,24 @@ mod git;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::RwLock,
     time::UNIX_EPOCH,
 };
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 20_000;
 const MAX_TREE_DEPTH: usize = 32;
+const MIN_RESEARCH_DRAFTS: usize = 2;
+const MAX_RESEARCH_DRAFTS: usize = 5;
+const MAX_RESEARCH_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESEARCH_TOTAL_TEXT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RESEARCH_STATE_BYTES: u64 = 40 * 1024 * 1024;
+const RESEARCH_STATE_VERSION: u8 = 1;
 
 type CommandResult<T> = Result<T, CommandError>;
 
@@ -99,6 +105,64 @@ struct FileDocument {
 struct SaveResult {
     modified_at_ms: u64,
     size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ResearchModel {
+    Chatgpt,
+    Gemini,
+    Claude,
+    Deepseek,
+    Grok,
+    Qwen,
+    Perplexity,
+}
+
+impl ResearchModel {
+    fn file_stem(self) -> &'static str {
+        match self {
+            Self::Chatgpt => "chatgpt",
+            Self::Gemini => "gemini",
+            Self::Claude => "claude",
+            Self::Deepseek => "deepseek",
+            Self::Grok => "grok",
+            Self::Qwen => "qwen",
+            Self::Perplexity => "perplexity",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResearchDraftState {
+    id: String,
+    model: ResearchModel,
+    content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResearchSavedFile {
+    model: ResearchModel,
+    file_name: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResearchWorkspaceState {
+    version: u8,
+    folder_path: String,
+    drafts: Vec<ResearchDraftState>,
+    saved_files: Vec<ResearchSavedFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResearchFileInput {
+    model: ResearchModel,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +388,136 @@ fn create_project_entry(
 }
 
 #[tauri::command]
+async fn load_research_state(app: AppHandle) -> CommandResult<Option<ResearchWorkspaceState>> {
+    let path = research_state_path(&app)?;
+    run_io_task(move || {
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(CommandError::io(
+                    "Could not inspect the saved research state",
+                    error,
+                ))
+            }
+        };
+        if metadata.len() > MAX_RESEARCH_STATE_BYTES {
+            return Err(CommandError::new(
+                "research_state_too_large",
+                "The saved research state exceeds the application limit.",
+            ));
+        }
+
+        let bytes = fs::read(&path)
+            .map_err(|error| CommandError::io("Could not read the research state", error))?;
+        let state: ResearchWorkspaceState = serde_json::from_slice(&bytes).map_err(|error| {
+            CommandError::new(
+                "invalid_research_state",
+                format!("The saved research state is invalid: {error}"),
+            )
+        })?;
+        validate_research_state(&state)?;
+        Ok(Some(state))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_research_state(
+    research_state: ResearchWorkspaceState,
+    app: AppHandle,
+) -> CommandResult<()> {
+    validate_research_state(&research_state)?;
+    let path = research_state_path(&app)?;
+    run_io_task(move || {
+        let parent = path.parent().ok_or_else(|| {
+            CommandError::new(
+                "invalid_research_state_path",
+                "The research state path has no parent directory.",
+            )
+        })?;
+        let payload = serde_json::to_vec(&research_state).map_err(|error| {
+            CommandError::new(
+                "research_state_error",
+                format!("Could not encode the research state: {error}"),
+            )
+        })?;
+        if payload.len() as u64 > MAX_RESEARCH_STATE_BYTES {
+            return Err(CommandError::new(
+                "research_state_too_large",
+                "The research state exceeds the application limit.",
+            ));
+        }
+
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| CommandError::io("Could not create a research state file", error))?;
+        temporary
+            .write_all(&payload)
+            .map_err(|error| CommandError::io("Could not write the research state", error))?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| CommandError::io("Could not flush the research state", error))?;
+        temporary.persist(&path).map_err(|error| {
+            CommandError::io("Could not replace the research state", error.error)
+        })?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn save_research_files(
+    folder_path: String,
+    entries: Vec<ResearchFileInput>,
+) -> CommandResult<Vec<ResearchSavedFile>> {
+    validate_research_entries(&entries)?;
+    run_io_task(move || {
+        let root = fs::canonicalize(Path::new(folder_path.trim()))
+            .map_err(|error| CommandError::io("Could not open the research folder", error))?;
+        if !root.is_dir() {
+            return Err(CommandError::new(
+                "not_a_directory",
+                "The selected research path is not a directory.",
+            ));
+        }
+
+        let mut next_indices = HashMap::<ResearchModel, u64>::new();
+        let mut created_paths = Vec::<PathBuf>::with_capacity(entries.len());
+        let mut saved_files = Vec::<ResearchSavedFile>::with_capacity(entries.len());
+
+        for entry in entries {
+            let next_index = match next_indices.get_mut(&entry.model) {
+                Some(index) => index,
+                None => {
+                    let index = next_research_index(&root, entry.model)?;
+                    next_indices.entry(entry.model).or_insert(index)
+                }
+            };
+            match create_research_file(&root, entry.model, &entry.content, next_index) {
+                Ok((path, file_name)) => {
+                    saved_files.push(ResearchSavedFile {
+                        model: entry.model,
+                        file_name,
+                        path: path_to_display_string(&path),
+                    });
+                    created_paths.push(path);
+                }
+                Err(error) => {
+                    for created_path in &created_paths {
+                        let _ = fs::remove_file(created_path);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(saved_files)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn get_git_workspace(state: State<'_, AppState>) -> CommandResult<git::GitWorkspace> {
     let root = current_root(&state)?;
     run_git_task(move || git::workspace(&root)).await
@@ -409,6 +603,21 @@ async fn git_commit_repository(
     .await
 }
 
+async fn run_io_task<T, F>(task: F) -> CommandResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> CommandResult<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                "research_task_error",
+                format!("Research file task failed: {error}"),
+            )
+        })?
+}
+
 async fn run_git_task<T, F>(task: F) -> CommandResult<T>
 where
     T: Send + 'static,
@@ -418,6 +627,195 @@ where
         .await
         .map_err(|error| CommandError::new("git_task_error", format!("Git task failed: {error}")))?
         .map_err(|message| CommandError::new("git_error", message))
+}
+
+fn research_state_path(app: &AppHandle) -> CommandResult<PathBuf> {
+    let directory = app.path().app_data_dir().map_err(|error| {
+        CommandError::new(
+            "research_state_path_error",
+            format!("Could not locate the application data directory: {error}"),
+        )
+    })?;
+    fs::create_dir_all(&directory).map_err(|error| {
+        CommandError::io("Could not create the application data directory", error)
+    })?;
+    Ok(directory.join("research-state.json"))
+}
+
+fn validate_research_state(state: &ResearchWorkspaceState) -> CommandResult<()> {
+    if state.version != RESEARCH_STATE_VERSION {
+        return Err(CommandError::new(
+            "unsupported_research_state",
+            "The saved research state uses an unsupported version.",
+        ));
+    }
+    if state.folder_path.len() > 32_768 {
+        return Err(CommandError::new(
+            "invalid_research_folder",
+            "The saved research folder path is too long.",
+        ));
+    }
+    if !(MIN_RESEARCH_DRAFTS..=MAX_RESEARCH_DRAFTS).contains(&state.drafts.len()) {
+        return Err(CommandError::new(
+            "invalid_research_count",
+            "Research must contain between 2 and 5 drafts.",
+        ));
+    }
+
+    let mut ids = HashSet::with_capacity(state.drafts.len());
+    let mut total_bytes = 0usize;
+    for draft in &state.drafts {
+        if draft.id.is_empty() || draft.id.len() > 128 || !ids.insert(draft.id.as_str()) {
+            return Err(CommandError::new(
+                "invalid_research_draft",
+                "Research draft identifiers must be unique and valid.",
+            ));
+        }
+        validate_research_text_size(&draft.content, &mut total_bytes)?;
+    }
+    if state.saved_files.len() > MAX_RESEARCH_DRAFTS {
+        return Err(CommandError::new(
+            "invalid_research_results",
+            "The saved research result list is too large.",
+        ));
+    }
+    if state.saved_files.iter().any(|file| {
+        file.file_name.is_empty()
+            || file.file_name.len() > 255
+            || file.path.is_empty()
+            || file.path.len() > 32_768
+    }) {
+        return Err(CommandError::new(
+            "invalid_research_results",
+            "A saved research result contains an invalid path.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_research_entries(entries: &[ResearchFileInput]) -> CommandResult<()> {
+    if !(MIN_RESEARCH_DRAFTS..=MAX_RESEARCH_DRAFTS).contains(&entries.len()) {
+        return Err(CommandError::new(
+            "invalid_research_count",
+            "Save between 2 and 5 research drafts at a time.",
+        ));
+    }
+    let mut total_bytes = 0usize;
+    for entry in entries {
+        if entry.content.trim().is_empty() {
+            return Err(CommandError::new(
+                "empty_research",
+                "Every research draft must contain text before saving.",
+            ));
+        }
+        validate_research_text_size(&entry.content, &mut total_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_research_text_size(content: &str, total_bytes: &mut usize) -> CommandResult<()> {
+    if content.len() > MAX_RESEARCH_TEXT_BYTES {
+        return Err(CommandError::new(
+            "research_too_large",
+            format!(
+                "A research draft exceeds the {} MiB limit.",
+                MAX_RESEARCH_TEXT_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+    *total_bytes = total_bytes.checked_add(content.len()).ok_or_else(|| {
+        CommandError::new(
+            "research_too_large",
+            "The research text size is out of range.",
+        )
+    })?;
+    if *total_bytes > MAX_RESEARCH_TOTAL_TEXT_BYTES {
+        return Err(CommandError::new(
+            "research_too_large",
+            format!(
+                "The combined research text exceeds the {} MiB limit.",
+                MAX_RESEARCH_TOTAL_TEXT_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn next_research_index(root: &Path, model: ResearchModel) -> CommandResult<u64> {
+    let prefix = format!("{}-research-", model.file_stem());
+    let mut highest = 0u64;
+    let entries = fs::read_dir(root)
+        .map_err(|error| CommandError::io("Could not inspect the research folder", error))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(number) = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".md"))
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        highest = highest.max(number);
+    }
+    highest.checked_add(1).ok_or_else(|| {
+        CommandError::new(
+            "research_sequence_exhausted",
+            "The research file sequence has no available numbers.",
+        )
+    })
+}
+
+fn create_research_file(
+    root: &Path,
+    model: ResearchModel,
+    content: &str,
+    next_index: &mut u64,
+) -> CommandResult<(PathBuf, String)> {
+    for _ in 0..100_000 {
+        let index = *next_index;
+        *next_index = next_index.checked_add(1).ok_or_else(|| {
+            CommandError::new(
+                "research_sequence_exhausted",
+                "The research file sequence has no available numbers.",
+            )
+        })?;
+        let file_name = format!("{}-research-{index}.md", model.file_stem());
+        let path = root.join(&file_name);
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(CommandError::io(
+                    "Could not create a research Markdown file",
+                    error,
+                ))
+            }
+        };
+
+        if let Err(error) = file.write_all(content.as_bytes()) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(CommandError::io(
+                "Could not write a research Markdown file",
+                error,
+            ));
+        }
+        if let Err(error) = file.sync_all() {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(CommandError::io(
+                "Could not flush a research Markdown file",
+                error,
+            ));
+        }
+        return Ok((path, file_name));
+    }
+
+    Err(CommandError::new(
+        "research_sequence_exhausted",
+        "Could not find an available research file number.",
+    ))
 }
 
 fn current_root(state: &State<'_, AppState>) -> CommandResult<PathBuf> {
@@ -659,6 +1057,9 @@ pub fn run() {
             read_project_file,
             write_project_file,
             create_project_entry,
+            load_research_state,
+            save_research_state,
+            save_research_files,
             get_git_workspace,
             git_stage_file,
             git_unstage_file,
@@ -699,6 +1100,46 @@ mod tests {
     fn converts_paths_to_slash_separated_strings() {
         let path = PathBuf::from("src").join("editor").join("mod.rs");
         assert_eq!(path_to_relative_string(&path), "src/editor/mod.rs");
+    }
+
+    #[test]
+    fn research_files_continue_after_the_highest_existing_number() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        fs::write(directory.path().join("chatgpt-research-2.md"), "existing")
+            .expect("fixture should be written");
+        let mut next = next_research_index(directory.path(), ResearchModel::Chatgpt)
+            .expect("next research index should be found");
+
+        let (_, file_name) = create_research_file(
+            directory.path(),
+            ResearchModel::Chatgpt,
+            "new text",
+            &mut next,
+        )
+        .expect("research file should be created");
+
+        assert_eq!(file_name, "chatgpt-research-3.md");
+        assert_eq!(
+            fs::read_to_string(directory.path().join(file_name))
+                .expect("research file should be readable"),
+            "new text"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_research_entries() {
+        let entries = vec![
+            ResearchFileInput {
+                model: ResearchModel::Chatgpt,
+                content: "valid".to_owned(),
+            },
+            ResearchFileInput {
+                model: ResearchModel::Gemini,
+                content: "  ".to_owned(),
+            },
+        ];
+        let error = validate_research_entries(&entries).expect_err("empty text should be rejected");
+        assert_eq!(error.code, "empty_research");
     }
 
     #[cfg(windows)]

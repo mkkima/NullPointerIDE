@@ -8,6 +8,9 @@ import type {
   GitCommitResult,
   GitWorkspace,
   ProjectSnapshot,
+  ResearchFileInput,
+  ResearchSavedFile,
+  ResearchWorkspaceState,
   SaveResult,
 } from "../types";
 
@@ -26,6 +29,16 @@ export async function chooseProjectFolder(): Promise<string | null> {
     directory: true,
     multiple: false,
     title: "Open project folder",
+  });
+  return typeof selection === "string" ? selection : null;
+}
+
+export async function chooseResearchFolder(): Promise<string | null> {
+  requireDesktopRuntime();
+  const selection = await open({
+    directory: true,
+    multiple: false,
+    title: "Choose research folder",
   });
   return typeof selection === "string" ? selection : null;
 }
@@ -93,6 +106,29 @@ export async function gitCommitRepository(
 ): Promise<GitCommitResult> {
   requireDesktopRuntime();
   return invoke<GitCommitResult>("git_commit_repository", { repository, message, action });
+}
+
+export async function loadResearchState(): Promise<ResearchWorkspaceState | null> {
+  requireDesktopRuntime();
+  return invoke<ResearchWorkspaceState | null>("load_research_state");
+}
+
+export async function saveResearchState(
+  researchState: ResearchWorkspaceState,
+): Promise<void> {
+  requireDesktopRuntime();
+  return invoke<void>("save_research_state", { researchState });
+}
+
+export async function saveResearchFiles(
+  folderPath: string,
+  entries: readonly ResearchFileInput[],
+): Promise<readonly ResearchSavedFile[]> {
+  requireDesktopRuntime();
+  return invoke<readonly ResearchSavedFile[]>("save_research_files", {
+    folderPath,
+    entries,
+  });
 }
 
 export function toAppError(error: unknown): AppError {

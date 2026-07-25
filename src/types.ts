@@ -27,6 +27,39 @@ export interface SaveResult {
   readonly size: number;
 }
 
+export type ResearchModel =
+  | "chatgpt"
+  | "gemini"
+  | "claude"
+  | "deepseek"
+  | "grok"
+  | "qwen"
+  | "perplexity";
+
+export interface ResearchDraft {
+  readonly id: string;
+  readonly model: ResearchModel;
+  readonly content: string;
+}
+
+export interface ResearchSavedFile {
+  readonly model: ResearchModel;
+  readonly fileName: string;
+  readonly path: string;
+}
+
+export interface ResearchWorkspaceState {
+  readonly version: 1;
+  readonly folderPath: string;
+  readonly drafts: readonly ResearchDraft[];
+  readonly savedFiles: readonly ResearchSavedFile[];
+}
+
+export interface ResearchFileInput {
+  readonly model: ResearchModel;
+  readonly content: string;
+}
+
 export interface AppError {
   readonly code: string;
   readonly message: string;

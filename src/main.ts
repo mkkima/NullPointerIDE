@@ -1,6 +1,7 @@
 import "@fontsource-variable/inter";
 import "./styles/main.css";
 import { EditorController } from "./editor/controller";
+import { ResearchController } from "./research/controller";
 import {
   chooseProjectFolder,
   createProjectEntry,
@@ -47,6 +48,9 @@ const GIT_COMMIT_OPTIONS: readonly {
   { action: "commit-sync", label: "Commit & Sync" },
 ];
 const ACTIVITYBAR_WIDTH = 56;
+type SidebarView = "explorer" | "source-control";
+type WorkspaceView = "editor" | "research";
+const SIDEBAR_VIEW_ORDER: readonly SidebarView[] = ["explorer", "source-control"];
 
 function element<T extends HTMLElement>(selector: string): T {
   const value = document.querySelector<T>(selector);
@@ -60,10 +64,12 @@ function escapeSelector(value: string): string {
 
 class NullPointerApp {
   private readonly shell = element<HTMLElement>("#shell");
+  private readonly workspace = element<HTMLElement>("#workspace");
   private readonly projectName = element<HTMLElement>("#project-name");
   private readonly projectPath = element<HTMLElement>("#project-path");
   private readonly sidebarTitle = element<HTMLElement>("#sidebar-title");
   private readonly explorerView = element<HTMLElement>("#explorer-view");
+  private readonly researchView = element<HTMLElement>("#research-view");
   private readonly explorerActions = element<HTMLElement>("#explorer-actions");
   private readonly scmActions = element<HTMLElement>("#scm-actions");
   private readonly scmView = element<HTMLElement>("#scm-view");
@@ -100,6 +106,7 @@ class NullPointerApp {
   private readonly entryInput = element<HTMLInputElement>("#entry-path");
   private readonly entryError = element<HTMLElement>("#entry-error");
   private readonly editor: EditorController;
+  private readonly research: ResearchController;
 
   private project: ProjectSnapshot | null = null;
   private gitWorkspace: GitWorkspace | null = null;
@@ -113,7 +120,8 @@ class NullPointerApp {
   private readonly disclosureAnimations = new WeakMap<HTMLElement, Animation>();
   private readonly disclosureCleanupTimers = new WeakMap<HTMLElement, number>();
   private readonly viewAnimations = new WeakMap<HTMLElement, Animation>();
-  private sidebarView: "explorer" | "source-control" = "explorer";
+  private sidebarView: SidebarView = "explorer";
+  private workspaceView: WorkspaceView = "editor";
   private graphRepository: string | null = null;
   private gitMenuSequence = 0;
   private graphCollapsed = false;
@@ -138,6 +146,10 @@ class NullPointerApp {
         this.cursorStatus.textContent = `Ln ${line}, Col ${column}`;
       },
     });
+    this.research = new ResearchController(this.researchView, {
+      onBusy: (busy, message) => this.setBusy(busy, message),
+      onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
+    });
     this.restoreSidebarWidth();
     this.bindEvents();
     this.syncChrome();
@@ -145,6 +157,7 @@ class NullPointerApp {
 
   start(): void {
     this.removeStorage(LEGACY_LAST_PROJECT_KEY);
+    void this.research.restore();
   }
 
   private bindEvents(): void {
@@ -168,6 +181,9 @@ class NullPointerApp {
       if (!this.gitWorkspace && !this.gitLoading) {
         void this.refreshGit();
       }
+    });
+    element<HTMLButtonElement>("#activity-research").addEventListener("click", () => {
+      this.showResearchWorkspace();
     });
     element<HTMLButtonElement>("#activity-search").addEventListener("click", () => {
       this.showQuickOpen();
@@ -1472,6 +1488,7 @@ class NullPointerApp {
   }
 
   private async openFile(path: string): Promise<void> {
+    this.showEditorWorkspace();
     if (this.editor.has(path)) {
       this.editor.activate(path);
       this.renderTabs();
@@ -1788,28 +1805,57 @@ class NullPointerApp {
     }
   }
 
-  private showSidebarView(view: "explorer" | "source-control"): void {
+  private showSidebarView(view: SidebarView): void {
+    this.showEditorWorkspace();
+    const previousView = this.sidebarView;
     const viewChanged = this.sidebarView !== view;
     this.sidebarView = view;
     if (this.sidebarCollapsed) {
       this.sidebarCollapsed = false;
       this.shell.classList.remove("sidebar-collapsed");
     }
-    const sourceControl = view === "source-control";
-    this.sidebarTitle.textContent = sourceControl ? "Source Control" : "Explorer";
-    this.explorerView.classList.toggle("hidden", sourceControl);
-    this.explorerActions.classList.toggle("hidden", sourceControl);
-    this.scmView.classList.toggle("hidden", !sourceControl);
-    this.scmActions.classList.toggle("hidden", !sourceControl);
+    const title = view === "source-control" ? "Source Control" : "Explorer";
+    const activeView = view === "source-control" ? this.scmView : this.explorerView;
+    this.sidebarTitle.textContent = title;
+    this.explorerView.classList.toggle("hidden", view !== "explorer");
+    this.explorerActions.classList.toggle("hidden", view !== "explorer");
+    this.scmView.classList.toggle("hidden", view !== "source-control");
+    this.scmActions.classList.toggle("hidden", view !== "source-control");
     this.syncSidebarActivity();
     if (viewChanged) {
-      this.animateViewEntrance(sourceControl ? this.scmView : this.explorerView, sourceControl ? 1 : -1);
-      this.animateViewEntrance(
-        sourceControl ? this.scmActions : this.explorerActions,
-        sourceControl ? 1 : -1,
-      );
-      this.animateViewEntrance(this.sidebarTitle, sourceControl ? 1 : -1);
+      const direction: -1 | 1 =
+        SIDEBAR_VIEW_ORDER.indexOf(view) > SIDEBAR_VIEW_ORDER.indexOf(previousView) ? 1 : -1;
+      this.animateViewEntrance(activeView, direction);
+      const activeActions =
+        view === "source-control"
+          ? this.scmActions
+          : this.explorerActions;
+      this.animateViewEntrance(activeActions, direction);
+      this.animateViewEntrance(this.sidebarTitle, direction);
     }
+  }
+
+  private showResearchWorkspace(): void {
+    const viewChanged = this.workspaceView !== "research";
+    this.workspaceView = "research";
+    this.workspace.classList.add("research-active");
+    this.researchView.classList.remove("hidden");
+    if (!this.sidebarCollapsed) {
+      this.sidebarCollapsed = true;
+      this.shell.classList.add("sidebar-collapsed");
+    }
+    this.syncChrome();
+    this.syncSidebarActivity();
+    if (viewChanged) this.animateViewEntrance(this.researchView, 1);
+  }
+
+  private showEditorWorkspace(): void {
+    if (this.workspaceView === "editor") return;
+    this.workspaceView = "editor";
+    this.workspace.classList.remove("research-active");
+    this.researchView.classList.add("hidden");
+    this.syncChrome();
+    this.syncSidebarActivity();
   }
 
   private toggleSidebar(): void {
@@ -1821,30 +1867,47 @@ class NullPointerApp {
   private syncSidebarActivity(): void {
     element<HTMLButtonElement>("#activity-explorer").classList.toggle(
       "active",
-      !this.sidebarCollapsed && this.sidebarView === "explorer",
+      this.workspaceView === "editor" &&
+        !this.sidebarCollapsed &&
+        this.sidebarView === "explorer",
     );
     element<HTMLButtonElement>("#activity-source-control").classList.toggle(
       "active",
-      !this.sidebarCollapsed && this.sidebarView === "source-control",
+      this.workspaceView === "editor" &&
+        !this.sidebarCollapsed &&
+        this.sidebarView === "source-control",
+    );
+    element<HTMLButtonElement>("#activity-research").classList.toggle(
+      "active",
+      this.workspaceView === "research",
     );
   }
 
   private syncChrome(): void {
     const active = this.editor.active;
     const hasProject = this.project !== null;
-    this.welcome.classList.toggle("hidden", active !== null);
-    this.editorHost.classList.toggle("hidden", active === null);
+    const researchActive = this.workspaceView === "research";
+    this.welcome.classList.toggle("hidden", researchActive || active !== null);
+    this.editorHost.classList.toggle("hidden", researchActive || active === null);
     this.tabs.classList.toggle("empty", this.editor.paths.length === 0);
-    this.saveButton.disabled = !active || !this.dirty.has(active);
+    this.saveButton.disabled = researchActive || !active || !this.dirty.has(active);
     this.newEntryButton.disabled = !hasProject;
     this.refreshButton.disabled = !hasProject;
     this.scmRefreshButton.disabled = !hasProject || this.gitLoading;
     const sourceChanges = this.gitWorkspace?.totalChanges ?? 0;
     this.scmBadge.textContent = sourceChanges > 99 ? "99+" : String(sourceChanges);
     this.scmBadge.classList.toggle("hidden", !hasProject || sourceChanges === 0);
-    this.cursorStatus.textContent = active ? this.cursorStatus.textContent : "Ln —, Col —";
-    this.languageStatus.textContent = active ? languageName(active) : "Plain Text";
-    this.generalStatus.textContent = active ? active : hasProject ? this.project?.rootPath ?? "" : "Ready";
+    this.cursorStatus.textContent =
+      researchActive ? "Research" : active ? this.cursorStatus.textContent : "Ln —, Col —";
+    this.languageStatus.textContent =
+      researchActive ? "Markdown" : active ? languageName(active) : "Plain Text";
+    this.generalStatus.textContent = researchActive
+      ? "Research workspace"
+      : active
+        ? active
+        : hasProject
+          ? this.project?.rootPath ?? ""
+          : "Ready";
   }
 
   private setBusy(busy: boolean, message?: string): void {
@@ -1988,6 +2051,9 @@ element<HTMLElement>("#app").innerHTML = `
       <button class="activity-button" id="activity-search" type="button" title="Quick open" aria-label="Quick open">
         ${icon("search", 23)}
       </button>
+      <button class="activity-button" id="activity-research" type="button" title="Research" aria-label="Research">
+        ${icon("flask", 23)}
+      </button>
       <button class="activity-button" id="activity-source-control" type="button" title="Source Control" aria-label="Source Control">
         ${icon("git-branch", 23)}
         <span class="activity-badge hidden" id="scm-badge">0</span>
@@ -2058,9 +2124,74 @@ element<HTMLElement>("#app").innerHTML = `
       <div class="sidebar-resizer" id="sidebar-resizer"></div>
     </aside>
 
-    <main class="workspace">
+    <main class="workspace" id="workspace">
       <div class="tabs" id="tabs" role="tablist" aria-label="Open editors"></div>
       <section class="editor-surface">
+        <section class="research-view hidden" id="research-view" aria-label="Research">
+          <button
+            class="research-folder-button"
+            id="research-folder-button"
+            type="button"
+            data-research-action="choose-folder"
+            aria-label="Choose research folder"
+          >
+            <span class="research-folder-icon">${icon("folder-open", 19)}</span>
+            <span class="research-folder-details">
+              <strong id="research-folder-name">Choose a folder</strong>
+              <small id="research-folder-path">Markdown files will be saved here.</small>
+            </span>
+            ${icon("chevron-right", 15)}
+          </button>
+
+          <div class="research-intro" id="research-intro">
+            <span class="research-intro-mark">${icon("flask", 25)}</span>
+            <strong>Select a destination first</strong>
+            <p>Your drafts, selected models and folder will be restored after restart.</p>
+            <button class="primary-button" type="button" data-research-action="choose-folder">
+              ${icon("folder-open", 17)} Choose folder
+            </button>
+          </div>
+
+          <div class="research-workspace hidden" id="research-workspace">
+            <div class="research-count-row">
+              <div>
+                <strong>Research drafts</strong>
+                <small>Keep between 2 and 5 windows</small>
+              </div>
+              <div class="research-stepper" aria-label="Research window count">
+                <button id="research-remove-draft" type="button" data-research-action="remove" aria-label="Remove last research window">
+                  ${icon("minus", 14)}
+                </button>
+                <span id="research-draft-count">2 / 5</span>
+                <button id="research-add-draft" type="button" data-research-action="add" aria-label="Add research window">
+                  ${icon("plus", 14)}
+                </button>
+              </div>
+            </div>
+
+            <div class="research-drafts" id="research-drafts"></div>
+
+            <div class="research-save-row">
+              <button class="research-save-button" id="research-save" type="button" data-research-action="save">
+                Save as Markdown
+              </button>
+              <p id="research-form-status">Add text to every research window.</p>
+            </div>
+
+            <section class="research-results hidden" id="research-results" aria-label="Saved research files">
+              <header>
+                <div>
+                  <strong>Saved files</strong>
+                  <small>Use the paths in your next workflow</small>
+                </div>
+              </header>
+              <div class="research-results-list" id="research-results-list"></div>
+              <button class="research-new-button" type="button" data-research-action="new">
+                ${icon("plus", 15)} Start new research
+              </button>
+            </section>
+          </div>
+        </section>
         <div class="welcome" id="welcome">
           <div class="welcome-glow"></div>
           <div class="welcome-content">
