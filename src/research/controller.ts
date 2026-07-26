@@ -5,6 +5,7 @@ import {
   saveResearchState,
   toAppError,
 } from "../services/native";
+import { icon } from "../ui/icons";
 import type {
   ResearchDraft,
   ResearchModel,
@@ -12,7 +13,9 @@ import type {
 } from "../types";
 
 const MIN_DRAFTS = 2;
-const MAX_DRAFTS = 5;
+const MAX_DRAFTS = 4;
+const MIN_DRAFT_HEIGHT = 180;
+const MAX_DRAFT_HEIGHT = 1_000;
 const PERSIST_DELAY_MS = 220;
 
 const MODELS: readonly { readonly value: ResearchModel; readonly label: string }[] = [
@@ -42,6 +45,7 @@ function createDraft(index: number): ResearchDraft {
     id: draftId(),
     model: MODELS[index % MODELS.length]?.value ?? "chatgpt",
     content: "",
+    heightPx: 0,
   };
 }
 
@@ -105,6 +109,9 @@ export class ResearchController {
     });
     this.root.addEventListener("input", (event) => this.handleInput(event));
     this.root.addEventListener("change", (event) => this.handleChange(event));
+    this.root.addEventListener("pointerdown", (event) => this.handleResizeStart(event));
+    this.root.addEventListener("dblclick", (event) => this.handleHeaderDoubleClick(event));
+    this.root.addEventListener("keydown", (event) => this.handleResizeKeydown(event));
     window.addEventListener("beforeunload", () => this.flushPersistence());
     this.render();
   }
@@ -128,8 +135,8 @@ export class ResearchController {
   private async handleClick(event: MouseEvent): Promise<void> {
     const target = event.target;
     if (!(target instanceof Element)) return;
-    const action = target.closest<HTMLElement>("[data-research-action]")?.dataset
-      .researchAction;
+    const actionTarget = target.closest<HTMLElement>("[data-research-action]");
+    const action = actionTarget?.dataset.researchAction;
     if (!action) return;
 
     if (action === "choose-folder") {
@@ -147,6 +154,10 @@ export class ResearchController {
       );
       const result = Number.isSafeInteger(index) ? this.state.savedFiles[index] : undefined;
       if (result) await this.copyPath(result.path);
+    } else if (action === "copy-content" && actionTarget?.dataset.researchDraftId) {
+      await this.copyDraftContent(actionTarget.dataset.researchDraftId);
+    } else if (action === "clear-content" && actionTarget?.dataset.researchDraftId) {
+      this.clearDraftContent(actionTarget.dataset.researchDraftId);
     } else if (action === "new") {
       this.startNewResearch();
     }
@@ -166,6 +177,12 @@ export class ResearchController {
       .closest<HTMLElement>(".research-draft")
       ?.querySelector<HTMLElement>(".research-character-count");
     if (count) count.textContent = this.characterCount(target.value);
+    target
+      .closest<HTMLElement>(".research-draft")
+      ?.querySelectorAll<HTMLButtonElement>("[data-research-draft-id]")
+      .forEach((button) => {
+        button.disabled = target.value.length === 0;
+      });
     this.syncControls();
     this.schedulePersistence();
   }
@@ -183,6 +200,123 @@ export class ResearchController {
       ),
     };
     this.schedulePersistence(true);
+  }
+
+  private handleResizeStart(event: PointerEvent): void {
+    if (event.button !== 0 || !event.isPrimary) return;
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const handle = target.closest<HTMLElement>("[data-research-resize]");
+    const id = handle?.dataset.researchResize;
+    if (!handle || !id) return;
+    const textarea = this.draftsHost.querySelector<HTMLTextAreaElement>(
+      `textarea[data-research-draft="${CSS.escape(id)}"]`,
+    );
+    if (!textarea) return;
+
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+    this.root.classList.add("research-resizing");
+    const startY = event.clientY;
+    const startHeight = textarea.getBoundingClientRect().height;
+    let latestHeight = Math.round(startHeight);
+
+    const onMove = (moveEvent: PointerEvent): void => {
+      if (moveEvent.pointerId !== event.pointerId) return;
+      latestHeight = this.clampDraftHeight(startHeight + moveEvent.clientY - startY);
+      textarea.style.height = `${latestHeight}px`;
+      handle.setAttribute("aria-valuenow", String(latestHeight));
+    };
+    const onEnd = (endEvent: PointerEvent): void => {
+      if (endEvent.pointerId !== event.pointerId) return;
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onEnd);
+      handle.removeEventListener("pointercancel", onEnd);
+      this.root.classList.remove("research-resizing");
+      this.setDraftHeight(id, latestHeight);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onEnd);
+    handle.addEventListener("pointercancel", onEnd);
+  }
+
+  private handleHeaderDoubleClick(event: MouseEvent): void {
+    const target = event.target;
+    if (!(target instanceof Element) || target.closest("button, select, option, input, a")) {
+      return;
+    }
+    const header = target.closest<HTMLElement>(".research-draft > header");
+    const card = header?.closest<HTMLElement>(".research-draft");
+    const id = card?.dataset.researchDraftId;
+    if (!header || !id) return;
+    event.preventDefault();
+    this.resetDraftHeight(id);
+  }
+
+  private handleResizeKeydown(event: KeyboardEvent): void {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || !target.dataset.researchResize) return;
+    const id = target.dataset.researchResize;
+    if (event.key === "Home") {
+      event.preventDefault();
+      this.resetDraftHeight(id);
+      return;
+    }
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    const textarea = this.draftsHost.querySelector<HTMLTextAreaElement>(
+      `textarea[data-research-draft="${CSS.escape(id)}"]`,
+    );
+    if (!textarea) return;
+    event.preventDefault();
+    const step = event.shiftKey ? 40 : 12;
+    const direction = event.key === "ArrowDown" ? 1 : -1;
+    const height = this.clampDraftHeight(
+      textarea.getBoundingClientRect().height + step * direction,
+    );
+    textarea.style.height = `${height}px`;
+    target.setAttribute("aria-valuenow", String(height));
+    this.setDraftHeight(id, height);
+  }
+
+  private clampDraftHeight(height: number): number {
+    return Math.round(Math.min(MAX_DRAFT_HEIGHT, Math.max(MIN_DRAFT_HEIGHT, height)));
+  }
+
+  private setDraftHeight(id: string, heightPx: number): void {
+    const height = this.clampDraftHeight(heightPx);
+    this.state = {
+      ...this.state,
+      drafts: this.state.drafts.map((draft) =>
+        draft.id === id ? { ...draft, heightPx: height } : draft,
+      ),
+    };
+    this.schedulePersistence(true);
+  }
+
+  private resetDraftHeight(id: string): void {
+    const index = this.state.drafts.findIndex((draft) => draft.id === id);
+    if (index < 0) return;
+    this.state = {
+      ...this.state,
+      drafts: this.state.drafts.map((draft) =>
+        draft.id === id ? { ...draft, heightPx: 0 } : draft,
+      ),
+    };
+    const textarea = this.draftsHost.querySelector<HTMLTextAreaElement>(
+      `textarea[data-research-draft="${CSS.escape(id)}"]`,
+    );
+    const handle = this.draftsHost.querySelector<HTMLElement>(
+      `[data-research-resize="${CSS.escape(id)}"]`,
+    );
+    if (textarea) {
+      textarea.style.removeProperty("height");
+      handle?.setAttribute(
+        "aria-valuenow",
+        String(Math.round(textarea.getBoundingClientRect().height)),
+      );
+    }
+    this.schedulePersistence(true);
+    this.options.onToast(`Research ${index + 1} size reset`, "neutral", 1600);
   }
 
   private async chooseFolder(): Promise<void> {
@@ -211,7 +345,10 @@ export class ResearchController {
       "chatgpt";
     this.state = {
       ...this.state,
-      drafts: [...this.state.drafts, { id: draftId(), model, content: "" }],
+      drafts: [
+        ...this.state.drafts,
+        { id: draftId(), model, content: "", heightPx: 0 },
+      ],
     };
     this.render();
     this.schedulePersistence(true);
@@ -303,8 +440,10 @@ export class ResearchController {
     this.state.drafts.forEach((draft, index) => {
       const card = document.createElement("article");
       card.className = "research-draft";
+      card.dataset.researchDraftId = draft.id;
 
       const header = document.createElement("header");
+      header.title = "Double-click to reset height";
       const number = document.createElement("span");
       number.className = "research-draft-number";
       number.textContent = `Research ${index + 1}`;
@@ -319,13 +458,38 @@ export class ResearchController {
         option.selected = model.value === draft.model;
         select.append(option);
       }
-      header.append(number, select);
+
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "research-draft-action";
+      copy.dataset.researchAction = "copy-content";
+      copy.dataset.researchDraftId = draft.id;
+      copy.disabled = draft.content.length === 0;
+      copy.title = "Copy research text";
+      copy.setAttribute("aria-label", `Copy research ${index + 1} text`);
+      copy.innerHTML = icon("copy", 14);
+
+      const clear = document.createElement("button");
+      clear.type = "button";
+      clear.className = "research-draft-action danger";
+      clear.dataset.researchAction = "clear-content";
+      clear.dataset.researchDraftId = draft.id;
+      clear.disabled = draft.content.length === 0;
+      clear.title = "Clear research text";
+      clear.setAttribute("aria-label", `Clear research ${index + 1} text`);
+      clear.innerHTML = icon("trash", 14);
+
+      const controls = document.createElement("div");
+      controls.className = "research-draft-controls";
+      controls.append(copy, clear, select);
+      header.append(number, controls);
 
       const textarea = document.createElement("textarea");
       textarea.dataset.researchDraft = draft.id;
       textarea.value = draft.content;
       textarea.placeholder = "Paste the research text here…";
       textarea.setAttribute("aria-label", `Research ${index + 1} text`);
+      if (draft.heightPx > 0) textarea.style.height = `${draft.heightPx}px`;
 
       const footer = document.createElement("footer");
       const count = document.createElement("span");
@@ -333,7 +497,21 @@ export class ResearchController {
       count.textContent = this.characterCount(draft.content);
       footer.append(count);
 
-      card.append(header, textarea, footer);
+      const resizeHandle = document.createElement("div");
+      resizeHandle.className = "research-resize-handle";
+      resizeHandle.dataset.researchResize = draft.id;
+      resizeHandle.tabIndex = 0;
+      resizeHandle.setAttribute("role", "separator");
+      resizeHandle.setAttribute("aria-orientation", "horizontal");
+      resizeHandle.setAttribute("aria-label", `Resize research ${index + 1}`);
+      resizeHandle.setAttribute("aria-valuemin", String(MIN_DRAFT_HEIGHT));
+      resizeHandle.setAttribute("aria-valuemax", String(MAX_DRAFT_HEIGHT));
+      resizeHandle.setAttribute(
+        "aria-valuenow",
+        String(draft.heightPx || 300),
+      );
+
+      card.append(header, textarea, footer, resizeHandle);
       fragment.append(card);
     });
     this.draftsHost.replaceChildren(fragment);
@@ -422,14 +600,68 @@ export class ResearchController {
       });
   }
 
+  private async copyDraftContent(id: string): Promise<void> {
+    const index = this.state.drafts.findIndex((draft) => draft.id === id);
+    const draft = index >= 0 ? this.state.drafts[index] : undefined;
+    if (!draft || draft.content.length === 0) return;
+    await this.copyText(
+      draft.content,
+      `Research ${index + 1} text copied`,
+      "Could not copy the research text.",
+    );
+  }
+
+  private clearDraftContent(id: string): void {
+    const index = this.state.drafts.findIndex((draft) => draft.id === id);
+    const draft = index >= 0 ? this.state.drafts[index] : undefined;
+    if (!draft || draft.content.length === 0) return;
+
+    this.state = {
+      ...this.state,
+      drafts: this.state.drafts.map((candidate) =>
+        candidate.id === id ? { ...candidate, content: "" } : candidate,
+      ),
+    };
+    const textarea = this.draftsHost.querySelector<HTMLTextAreaElement>(
+      `textarea[data-research-draft="${CSS.escape(id)}"]`,
+    );
+    if (textarea) {
+      textarea.value = "";
+      const card = textarea.closest<HTMLElement>(".research-draft");
+      const count = card?.querySelector<HTMLElement>(".research-character-count");
+      if (count) count.textContent = this.characterCount("");
+      card
+        ?.querySelectorAll<HTMLButtonElement>("[data-research-draft-id]")
+        .forEach((button) => {
+          button.disabled = true;
+        });
+      textarea.focus();
+    }
+    this.syncControls();
+    this.schedulePersistence(true);
+    this.options.onToast(`Research ${index + 1} cleared`, "neutral", 1800);
+  }
+
   private async copyPath(path: string): Promise<void> {
+    await this.copyText(
+      path,
+      "Research path copied",
+      "Could not copy the research path.",
+    );
+  }
+
+  private async copyText(
+    value: string,
+    successMessage: string,
+    errorMessage: string,
+  ): Promise<void> {
     try {
-      await navigator.clipboard.writeText(path);
-      this.options.onToast("Research path copied", "success", 1800);
+      await navigator.clipboard.writeText(value);
+      this.options.onToast(successMessage, "success", 1800);
       return;
     } catch {
       const input = document.createElement("textarea");
-      input.value = path;
+      input.value = value;
       input.setAttribute("readonly", "");
       input.style.position = "fixed";
       input.style.opacity = "0";
@@ -438,10 +670,10 @@ export class ResearchController {
       const copied = document.execCommand("copy");
       input.remove();
       if (!copied) {
-        this.options.onToast("Could not copy the research path.", "error", 4000);
+        this.options.onToast(errorMessage, "error", 4000);
         return;
       }
-      this.options.onToast("Research path copied", "success", 1800);
+      this.options.onToast(successMessage, "success", 1800);
     }
   }
 }

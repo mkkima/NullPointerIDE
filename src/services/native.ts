@@ -1,7 +1,9 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AppError,
+  AppRelease,
+  AppUpdateEvent,
   CreateKind,
   FileDocument,
   GitCommitAction,
@@ -31,6 +33,26 @@ export async function chooseProjectFolder(): Promise<string | null> {
     title: "Open project folder",
   });
   return typeof selection === "string" ? selection : null;
+}
+
+export async function isProductionBuild(): Promise<boolean> {
+  if (!isTauri()) return false;
+  return invoke<boolean>("is_production_build");
+}
+
+export async function listAppReleases(): Promise<readonly AppRelease[]> {
+  requireDesktopRuntime();
+  return invoke<readonly AppRelease[]>("list_app_releases");
+}
+
+export async function installAppVersion(
+  version: string,
+  onEvent: (event: AppUpdateEvent) => void,
+): Promise<void> {
+  requireDesktopRuntime();
+  const channel = new Channel<AppUpdateEvent>();
+  channel.onmessage = onEvent;
+  return invoke<void>("install_app_version", { version, onEvent: channel });
 }
 
 export async function chooseResearchFolder(): Promise<string | null> {

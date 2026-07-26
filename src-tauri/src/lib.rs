@@ -7,20 +7,28 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    sync::RwLock,
-    time::UNIX_EPOCH,
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        RwLock,
+    },
+    time::{Duration, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager, State};
+use tauri::{ipc::Channel, AppHandle, Manager, State, Url};
+use tauri_plugin_updater::UpdaterExt;
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 20_000;
 const MAX_TREE_DEPTH: usize = 32;
 const MIN_RESEARCH_DRAFTS: usize = 2;
-const MAX_RESEARCH_DRAFTS: usize = 5;
+const MAX_RESEARCH_DRAFTS: usize = 4;
 const MAX_RESEARCH_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESEARCH_TOTAL_TEXT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESEARCH_STATE_BYTES: u64 = 40 * 1024 * 1024;
 const RESEARCH_STATE_VERSION: u8 = 1;
+const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/mkkima/NullPointerIDE/releases?per_page=20";
+const GITHUB_RELEASE_RESPONSE_LIMIT: u64 = 2 * 1024 * 1024;
+const UPDATE_MANIFEST_NAME: &str = "latest.json";
 
 type CommandResult<T> = Result<T, CommandError>;
 
@@ -43,6 +51,19 @@ struct GitCommitResult {
 #[derive(Default)]
 struct AppState {
     project_root: RwLock<Option<PathBuf>>,
+}
+
+#[derive(Default)]
+struct UpdateState {
+    installing: AtomicBool,
+}
+
+struct UpdateInstallGuard<'a>(&'a AtomicBool);
+
+impl Drop for UpdateInstallGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, AtomicOrdering::Release);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +128,42 @@ struct SaveResult {
     size: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    published_at: Option<String>,
+    html_url: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppRelease {
+    version: String,
+    name: String,
+    notes: String,
+    published_at: Option<String>,
+    release_url: String,
+    update_available: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "event", content = "data", rename_all = "camelCase")]
+enum AppUpdateEvent {
+    Started { content_length: Option<u64> },
+    Progress { chunk_length: usize },
+    Finished,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ResearchModel {
@@ -139,6 +196,8 @@ struct ResearchDraftState {
     id: String,
     model: ResearchModel,
     content: String,
+    #[serde(default)]
+    height_px: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -217,6 +276,184 @@ fn open_project(path: String, state: State<'_, AppState>) -> CommandResult<Proje
         .map_err(|_| CommandError::new("state_error", "Project state is unavailable."))?;
     *project_root = Some(root);
     Ok(snapshot)
+}
+
+#[tauri::command]
+fn is_production_build() -> bool {
+    !cfg!(debug_assertions)
+}
+
+#[tauri::command]
+async fn list_app_releases() -> CommandResult<Vec<AppRelease>> {
+    ensure_tls_provider();
+    let client = reqwest::Client::builder()
+        .user_agent(format!("NullPointerIDE/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|error| {
+            CommandError::new(
+                "release_client_error",
+                format!("Could not prepare the release request: {error}"),
+            )
+        })?;
+    let response = client
+        .get(GITHUB_RELEASES_URL)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                "release_network_error",
+                format!("Could not load the release history: {error}"),
+            )
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let message = if status.as_u16() == 403 {
+            "GitHub temporarily refused the release request. Try again in a few minutes.".to_owned()
+        } else {
+            format!("GitHub returned {status} while loading the release history.")
+        };
+        return Err(CommandError::new("release_http_error", message));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > GITHUB_RELEASE_RESPONSE_LIMIT)
+    {
+        return Err(CommandError::new(
+            "release_response_too_large",
+            "The release history response exceeds the application limit.",
+        ));
+    }
+
+    let bytes = response.bytes().await.map_err(|error| {
+        CommandError::new(
+            "release_network_error",
+            format!("Could not read the release history: {error}"),
+        )
+    })?;
+    if bytes.len() as u64 > GITHUB_RELEASE_RESPONSE_LIMIT {
+        return Err(CommandError::new(
+            "release_response_too_large",
+            "The release history response exceeds the application limit.",
+        ));
+    }
+
+    let releases: Vec<GitHubRelease> = serde_json::from_slice(&bytes).map_err(|error| {
+        CommandError::new(
+            "invalid_release_response",
+            format!("GitHub returned an invalid release history: {error}"),
+        )
+    })?;
+    Ok(releases
+        .into_iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(app_release_from_github)
+        .collect())
+}
+
+#[tauri::command]
+async fn install_app_version(
+    version: String,
+    on_event: Channel<AppUpdateEvent>,
+    app: AppHandle,
+    state: State<'_, UpdateState>,
+) -> CommandResult<()> {
+    if cfg!(debug_assertions) {
+        return Err(CommandError::new(
+            "production_only",
+            "Version installation is available only in a packaged production build.",
+        ));
+    }
+
+    let requested = semver::Version::parse(version.trim()).map_err(|_| {
+        CommandError::new(
+            "invalid_update_version",
+            "The selected application version is invalid.",
+        )
+    })?;
+    if state
+        .installing
+        .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+        .is_err()
+    {
+        return Err(CommandError::new(
+            "update_in_progress",
+            "Another application update is already in progress.",
+        ));
+    }
+    let _guard = UpdateInstallGuard(&state.installing);
+
+    let endpoint = update_manifest_url(&requested)?;
+    let selected = requested.clone();
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|error| {
+            CommandError::new(
+                "update_configuration_error",
+                format!("Could not select the requested update: {error}"),
+            )
+        })?
+        .version_comparator(move |current, release| {
+            release.version == selected && release.version != current
+        })
+        .build()
+        .map_err(|error| {
+            CommandError::new(
+                "update_configuration_error",
+                format!("Could not prepare the updater: {error}"),
+            )
+        })?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                "update_check_error",
+                format!("Could not verify the selected version: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            CommandError::new(
+                "update_unavailable",
+                "This version is already installed or no longer has a compatible updater.",
+            )
+        })?;
+    if update.version != requested.to_string() {
+        return Err(CommandError::new(
+            "update_version_mismatch",
+            "The signed updater does not match the selected version.",
+        ));
+    }
+
+    let progress_events = on_event.clone();
+    let finish_events = on_event;
+    let mut started = false;
+    update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                if !started {
+                    started = true;
+                    let _ = progress_events.send(AppUpdateEvent::Started { content_length });
+                }
+                let _ = progress_events.send(AppUpdateEvent::Progress { chunk_length });
+            },
+            move || {
+                let _ = finish_events.send(AppUpdateEvent::Finished);
+            },
+        )
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                "update_install_error",
+                format!("Could not install the signed update: {error}"),
+            )
+        })?;
+
+    app.restart();
 }
 
 #[tauri::command]
@@ -410,12 +647,17 @@ async fn load_research_state(app: AppHandle) -> CommandResult<Option<ResearchWor
 
         let bytes = fs::read(&path)
             .map_err(|error| CommandError::io("Could not read the research state", error))?;
-        let state: ResearchWorkspaceState = serde_json::from_slice(&bytes).map_err(|error| {
-            CommandError::new(
-                "invalid_research_state",
-                format!("The saved research state is invalid: {error}"),
-            )
-        })?;
+        let mut state: ResearchWorkspaceState =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                CommandError::new(
+                    "invalid_research_state",
+                    format!("The saved research state is invalid: {error}"),
+                )
+            })?;
+        // Version 1 originally allowed five drafts. Keep the first four when
+        // loading that legacy state instead of rejecting the entire workspace.
+        state.drafts.truncate(MAX_RESEARCH_DRAFTS);
+        state.saved_files.truncate(MAX_RESEARCH_DRAFTS);
         validate_research_state(&state)?;
         Ok(Some(state))
     })
@@ -629,6 +871,69 @@ where
         .map_err(|message| CommandError::new("git_error", message))
 }
 
+fn app_release_from_github(release: GitHubRelease) -> Option<AppRelease> {
+    let version = release_version(&release.tag_name)?;
+    let update_available = release
+        .assets
+        .iter()
+        .any(|asset| asset.name.eq_ignore_ascii_case(UPDATE_MANIFEST_NAME));
+    let default_name = format!("NullPointer {version}");
+    Some(AppRelease {
+        version,
+        name: truncate_text(
+            release
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(&default_name),
+            200,
+        ),
+        notes: truncate_text(release.body.as_deref().unwrap_or(""), 30_000),
+        published_at: release.published_at,
+        release_url: release.html_url,
+        update_available,
+    })
+}
+
+fn ensure_tls_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // A concurrent updater check may win this race; either provider is valid.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+fn release_version(tag: &str) -> Option<String> {
+    let candidate = tag
+        .trim()
+        .strip_prefix("app-v")
+        .or_else(|| tag.trim().strip_prefix('v'))?;
+    semver::Version::parse(candidate)
+        .ok()
+        .map(|version| version.to_string())
+}
+
+fn update_manifest_url(version: &semver::Version) -> CommandResult<Url> {
+    Url::parse(&format!(
+        "https://github.com/mkkima/NullPointerIDE/releases/download/app-v{version}/{UPDATE_MANIFEST_NAME}"
+    ))
+    .map_err(|error| {
+        CommandError::new(
+            "update_configuration_error",
+            format!("Could not build the selected update URL: {error}"),
+        )
+    })
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut characters = value.chars();
+    let truncated = characters.by_ref().take(max_chars).collect::<String>();
+    if characters.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 fn research_state_path(app: &AppHandle) -> CommandResult<PathBuf> {
     let directory = app.path().app_data_dir().map_err(|error| {
         CommandError::new(
@@ -658,7 +963,7 @@ fn validate_research_state(state: &ResearchWorkspaceState) -> CommandResult<()> 
     if !(MIN_RESEARCH_DRAFTS..=MAX_RESEARCH_DRAFTS).contains(&state.drafts.len()) {
         return Err(CommandError::new(
             "invalid_research_count",
-            "Research must contain between 2 and 5 drafts.",
+            "Research must contain between 2 and 4 drafts.",
         ));
     }
 
@@ -669,6 +974,12 @@ fn validate_research_state(state: &ResearchWorkspaceState) -> CommandResult<()> 
             return Err(CommandError::new(
                 "invalid_research_draft",
                 "Research draft identifiers must be unique and valid.",
+            ));
+        }
+        if draft.height_px != 0 && !(180..=1_000).contains(&draft.height_px) {
+            return Err(CommandError::new(
+                "invalid_research_draft",
+                "Research draft height is outside the supported range.",
             ));
         }
         validate_research_text_size(&draft.content, &mut total_bytes)?;
@@ -697,7 +1008,7 @@ fn validate_research_entries(entries: &[ResearchFileInput]) -> CommandResult<()>
     if !(MIN_RESEARCH_DRAFTS..=MAX_RESEARCH_DRAFTS).contains(&entries.len()) {
         return Err(CommandError::new(
             "invalid_research_count",
-            "Save between 2 and 5 research drafts at a time.",
+            "Save between 2 and 4 research drafts at a time.",
         ));
     }
     let mut total_bytes = 0usize;
@@ -1050,8 +1361,14 @@ fn path_to_display_string(path: &Path) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
+        .manage(UpdateState::default())
         .invoke_handler(tauri::generate_handler![
+            is_production_build,
+            list_app_releases,
+            install_app_version,
             open_project,
             refresh_project,
             read_project_file,
@@ -1094,6 +1411,23 @@ mod tests {
             "/secret.txt"
         };
         assert!(normalize_relative(absolute).is_err());
+    }
+
+    #[test]
+    fn accepts_release_tags_created_by_the_release_workflow() {
+        assert_eq!(release_version("app-v0.42.1"), Some("0.42.1".to_owned()));
+        assert_eq!(release_version("v1.2.3"), Some("1.2.3".to_owned()));
+        assert_eq!(release_version("nightly"), None);
+    }
+
+    #[test]
+    fn builds_a_version_specific_update_manifest_url() {
+        let version = semver::Version::parse("1.2.3").expect("fixture should be valid");
+        let url = update_manifest_url(&version).expect("URL should be valid");
+        assert_eq!(
+            url.as_str(),
+            "https://github.com/mkkima/NullPointerIDE/releases/download/app-v1.2.3/latest.json"
+        );
     }
 
     #[test]
@@ -1140,6 +1474,46 @@ mod tests {
         ];
         let error = validate_research_entries(&entries).expect_err("empty text should be rejected");
         assert_eq!(error.code, "empty_research");
+    }
+
+    #[test]
+    fn legacy_research_drafts_default_to_automatic_height() {
+        let state: ResearchWorkspaceState = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "folderPath": "",
+                "drafts": [
+                    {"id": "one", "model": "chatgpt", "content": ""},
+                    {"id": "two", "model": "gemini", "content": ""}
+                ],
+                "savedFiles": []
+            }"#,
+        )
+        .expect("legacy state should remain readable");
+
+        assert!(state.drafts.iter().all(|draft| draft.height_px == 0));
+        validate_research_state(&state).expect("legacy state should be valid");
+    }
+
+    #[test]
+    fn rejects_more_than_four_research_entries() {
+        let entries = [
+            ResearchModel::Chatgpt,
+            ResearchModel::Gemini,
+            ResearchModel::Claude,
+            ResearchModel::Deepseek,
+            ResearchModel::Grok,
+        ]
+        .into_iter()
+        .map(|model| ResearchFileInput {
+            model,
+            content: "research".to_owned(),
+        })
+        .collect::<Vec<_>>();
+
+        let error =
+            validate_research_entries(&entries).expect_err("fifth draft should be rejected");
+        assert_eq!(error.code, "invalid_research_count");
     }
 
     #[cfg(windows)]

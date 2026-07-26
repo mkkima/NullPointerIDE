@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nullpointer-release-main
+  cancel-in-progress: true
+
+jobs:
+  release-windows:
+    name: Build and publish Windows update
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Verify frontend
+        run: npm run check
+
+      - name: Verify Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Generate automatic release version
+        shell: pwsh
+        run: |
+          $version = "0.${{ github.run_number }}.${{ github.run_attempt }}"
+          node scripts/set-release-version.mjs $version
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Build, sign and publish release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          tagName: app-v__VERSION__
+          releaseName: NullPointer v__VERSION__
+          releaseBody: |
+            Automatic build from `${{ github.sha }}`.
+            Installed copies of NullPointer will receive this update automatically.
+          releaseDraft: false
+          prerelease: false
+          releaseCommitish: ${{ github.sha }}
+          updaterJsonPreferNsis: true

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A fast, focused code editor"
 authors = ["NullPointer contributors"]
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.85"
 
 [lib]
 name = "nullpointer_ide_lib"
@@ -14,10 +14,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-process = "2.3.1"
+tauri-plugin-updater = "2.10.1"
 tempfile = "3"
 
 [profile.release]

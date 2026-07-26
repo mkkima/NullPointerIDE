@@ -2,6 +2,8 @@ import "@fontsource-variable/inter";
 import "./styles/main.css";
 import { EditorController } from "./editor/controller";
 import { ResearchController } from "./research/controller";
+import { checkAndInstallUpdate } from "./services/updater";
+import { UpdatesController } from "./updates/controller";
 import {
   chooseProjectFolder,
   createProjectEntry,
@@ -48,9 +50,10 @@ const GIT_COMMIT_OPTIONS: readonly {
   { action: "commit-sync", label: "Commit & Sync" },
 ];
 const ACTIVITYBAR_WIDTH = 56;
-type SidebarView = "explorer" | "source-control";
+const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+type SidebarView = "explorer" | "source-control" | "updates";
 type WorkspaceView = "editor" | "research";
-const SIDEBAR_VIEW_ORDER: readonly SidebarView[] = ["explorer", "source-control"];
+const SIDEBAR_VIEW_ORDER: readonly SidebarView[] = ["explorer", "source-control", "updates"];
 
 function element<T extends HTMLElement>(selector: string): T {
   const value = document.querySelector<T>(selector);
@@ -72,7 +75,9 @@ class NullPointerApp {
   private readonly researchView = element<HTMLElement>("#research-view");
   private readonly explorerActions = element<HTMLElement>("#explorer-actions");
   private readonly scmActions = element<HTMLElement>("#scm-actions");
+  private readonly updatesActions = element<HTMLElement>("#updates-actions");
   private readonly scmView = element<HTMLElement>("#scm-view");
+  private readonly updatesView = element<HTMLElement>("#updates-view");
   private readonly scmRepositories = element<HTMLElement>("#scm-repositories");
   private readonly scmGraph = element<HTMLElement>("#scm-graph");
   private readonly scmGraphBody = element<HTMLElement>("#scm-graph-body");
@@ -107,6 +112,7 @@ class NullPointerApp {
   private readonly entryError = element<HTMLElement>("#entry-error");
   private readonly editor: EditorController;
   private readonly research: ResearchController;
+  private readonly updates: UpdatesController;
 
   private project: ProjectSnapshot | null = null;
   private gitWorkspace: GitWorkspace | null = null;
@@ -132,6 +138,8 @@ class NullPointerApp {
   private createKind: CreateKind = "file";
   private busyCount = 0;
   private projectGeneration = 0;
+  private updateCheckInFlight = false;
+  private deferredUpdateVersion: string | null = null;
   private readonly treeAnimationGenerations = new Map<string, number>();
 
   constructor() {
@@ -150,6 +158,18 @@ class NullPointerApp {
       onBusy: (busy, message) => this.setBusy(busy, message),
       onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
     });
+    this.updates = new UpdatesController(this.updatesView, {
+      canInstall: () =>
+        this.dirty.size === 0 &&
+        this.busyCount === 0 &&
+        !this.quickDialog.open &&
+        !this.entryDialog.open,
+      onAutoChange: (enabled) => {
+        if (enabled) void this.checkForUpdates();
+      },
+      onBusy: (busy, message) => this.setBusy(busy, message),
+      onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
+    });
     this.restoreSidebarWidth();
     this.bindEvents();
     this.syncChrome();
@@ -158,6 +178,62 @@ class NullPointerApp {
   start(): void {
     this.removeStorage(LEGACY_LAST_PROJECT_KEY);
     void this.research.restore();
+    void this.updates.start();
+    window.setTimeout(() => void this.checkForUpdates(), 1_200);
+    window.setInterval(
+      () => void this.checkForUpdates(),
+      UPDATE_CHECK_INTERVAL_MS,
+    );
+  }
+
+  private async checkForUpdates(): Promise<void> {
+    if (this.updateCheckInFlight || !this.updates.automaticUpdatesEnabled()) return;
+    this.updateCheckInFlight = true;
+    let installing = false;
+    try {
+      const outcome = await checkAndInstallUpdate({
+        canInstall: () =>
+          this.dirty.size === 0 &&
+          this.busyCount === 0 &&
+          !this.quickDialog.open &&
+          !this.entryDialog.open,
+        onAvailable: (version) => {
+          installing = true;
+          this.setBusy(true, `Installing update ${version}…`);
+          this.toast(`Installing NullPointer ${version}…`, "neutral", 5000);
+        },
+        onProgress: (downloaded, total) => {
+          if (total && total > 0) {
+            const percent = Math.min(100, Math.round((downloaded / total) * 100));
+            this.generalStatus.textContent = `Updating NullPointer… ${percent}%`;
+          } else {
+            this.generalStatus.textContent = "Updating NullPointer…";
+          }
+        },
+      });
+      if (
+        outcome.status === "deferred" &&
+        this.deferredUpdateVersion !== outcome.version
+      ) {
+        this.deferredUpdateVersion = outcome.version;
+        this.toast(
+          `Update ${outcome.version} will install on the next clean launch.`,
+          "neutral",
+          5000,
+        );
+      }
+    } catch (error) {
+      if (installing) {
+        this.toast(
+          `Update failed: ${toAppError(error).message}`,
+          "error",
+          5000,
+        );
+      }
+    } finally {
+      if (installing) this.setBusy(false);
+      this.updateCheckInFlight = false;
+    }
   }
 
   private bindEvents(): void {
@@ -182,6 +258,10 @@ class NullPointerApp {
         void this.refreshGit();
       }
     });
+    element<HTMLButtonElement>("#activity-updates").addEventListener("click", () => {
+      this.showSidebarView("updates");
+      void this.updates.activate();
+    });
     element<HTMLButtonElement>("#activity-research").addEventListener("click", () => {
       this.showResearchWorkspace();
     });
@@ -195,6 +275,9 @@ class NullPointerApp {
     this.newEntryButton.addEventListener("click", () => this.showEntryDialog());
     this.refreshButton.addEventListener("click", () => void this.refreshTree());
     this.scmRefreshButton.addEventListener("click", () => void this.refreshGit());
+    element<HTMLButtonElement>("#updates-refresh-button").addEventListener("click", () => {
+      void this.updates.refresh();
+    });
     this.scmGraphToggle.addEventListener("click", () => {
       this.graphCollapsed = !this.graphCollapsed;
       this.syncGraphCollapsed();
@@ -1814,13 +1897,21 @@ class NullPointerApp {
       this.sidebarCollapsed = false;
       this.shell.classList.remove("sidebar-collapsed");
     }
-    const title = view === "source-control" ? "Source Control" : "Explorer";
-    const activeView = view === "source-control" ? this.scmView : this.explorerView;
+    const title =
+      view === "source-control" ? "Source Control" : view === "updates" ? "Updates" : "Explorer";
+    const activeView =
+      view === "source-control"
+        ? this.scmView
+        : view === "updates"
+          ? this.updatesView
+          : this.explorerView;
     this.sidebarTitle.textContent = title;
     this.explorerView.classList.toggle("hidden", view !== "explorer");
     this.explorerActions.classList.toggle("hidden", view !== "explorer");
     this.scmView.classList.toggle("hidden", view !== "source-control");
     this.scmActions.classList.toggle("hidden", view !== "source-control");
+    this.updatesView.classList.toggle("hidden", view !== "updates");
+    this.updatesActions.classList.toggle("hidden", view !== "updates");
     this.syncSidebarActivity();
     if (viewChanged) {
       const direction: -1 | 1 =
@@ -1829,7 +1920,9 @@ class NullPointerApp {
       const activeActions =
         view === "source-control"
           ? this.scmActions
-          : this.explorerActions;
+          : view === "updates"
+            ? this.updatesActions
+            : this.explorerActions;
       this.animateViewEntrance(activeActions, direction);
       this.animateViewEntrance(this.sidebarTitle, direction);
     }
@@ -1876,6 +1969,12 @@ class NullPointerApp {
       this.workspaceView === "editor" &&
         !this.sidebarCollapsed &&
         this.sidebarView === "source-control",
+    );
+    element<HTMLButtonElement>("#activity-updates").classList.toggle(
+      "active",
+      this.workspaceView === "editor" &&
+        !this.sidebarCollapsed &&
+        this.sidebarView === "updates",
     );
     element<HTMLButtonElement>("#activity-research").classList.toggle(
       "active",
@@ -2058,6 +2157,9 @@ element<HTMLElement>("#app").innerHTML = `
         ${icon("git-branch", 23)}
         <span class="activity-badge hidden" id="scm-badge">0</span>
       </button>
+      <button class="activity-button" id="activity-updates" type="button" title="Updates" aria-label="Updates">
+        ${icon("history", 23)}
+      </button>
       <span class="activity-spacer"></span>
       <button class="activity-button" id="toggle-sidebar-button" type="button" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar">
         ${icon("panel-left", 22)}
@@ -2077,6 +2179,11 @@ element<HTMLElement>("#app").innerHTML = `
         </div>
         <div class="sidebar-actions hidden" id="scm-actions">
           <button class="mini-button" id="scm-refresh-button" type="button" title="Refresh source control" aria-label="Refresh source control">
+            ${icon("refresh", 17)}
+          </button>
+        </div>
+        <div class="sidebar-actions hidden" id="updates-actions">
+          <button class="mini-button" id="updates-refresh-button" type="button" title="Check for releases" aria-label="Check for releases">
             ${icon("refresh", 17)}
           </button>
         </div>
@@ -2121,6 +2228,44 @@ element<HTMLElement>("#app").innerHTML = `
           <div class="scm-graph-body" id="scm-graph-body"></div>
         </section>
       </section>
+      <section class="updates-view hidden" id="updates-view" aria-label="Application updates">
+        <div class="update-overview">
+          <div class="update-version-mark">${icon("history", 22)}</div>
+          <div class="update-version-copy">
+            <small>Installed version</small>
+            <strong id="update-current-version">Loading…</strong>
+          </div>
+          <span class="update-summary-status" id="update-summary-status" data-tone="neutral">Not checked yet</span>
+        </div>
+
+        <label class="update-auto-row" for="update-auto-toggle">
+          <span>
+            <strong>Automatic updates</strong>
+            <small id="update-auto-caption">Checks quietly every 30 minutes</small>
+          </span>
+          <input id="update-auto-toggle" type="checkbox" />
+          <span class="update-switch" aria-hidden="true"></span>
+        </label>
+
+        <div class="update-security-note">
+          ${icon("check", 15)}
+          <span>Every installer is verified with the app signing key before it can run.</span>
+        </div>
+
+        <div class="update-install-progress hidden" id="update-progress" role="status" aria-live="polite">
+          <span id="update-progress-label">Preparing update…</span>
+          <div><i id="update-progress-value"></i></div>
+        </div>
+
+        <div class="update-history-header">
+          <div>
+            <strong>Version history</strong>
+            <small id="update-last-checked">Release history from GitHub</small>
+          </div>
+          <button type="button" data-update-action="refresh">Check now</button>
+        </div>
+        <div class="update-release-list" id="update-release-list"></div>
+      </section>
       <div class="sidebar-resizer" id="sidebar-resizer"></div>
     </aside>
 
@@ -2156,13 +2301,13 @@ element<HTMLElement>("#app").innerHTML = `
             <div class="research-count-row">
               <div>
                 <strong>Research drafts</strong>
-                <small>Keep between 2 and 5 windows</small>
+                <small>Keep between 2 and 4 windows</small>
               </div>
               <div class="research-stepper" aria-label="Research window count">
                 <button id="research-remove-draft" type="button" data-research-action="remove" aria-label="Remove last research window">
                   ${icon("minus", 14)}
                 </button>
-                <span id="research-draft-count">2 / 5</span>
+                <span id="research-draft-count">2 / 4</span>
                 <button id="research-add-draft" type="button" data-research-action="add" aria-label="Add research window">
                   ${icon("plus", 14)}
                 </button>

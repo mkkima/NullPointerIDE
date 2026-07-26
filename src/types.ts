@@ -27,6 +27,26 @@ export interface SaveResult {
   readonly size: number;
 }
 
+export interface AppRelease {
+  readonly version: string;
+  readonly name: string;
+  readonly notes: string;
+  readonly publishedAt: string | null;
+  readonly releaseUrl: string;
+  readonly updateAvailable: boolean;
+}
+
+export type AppUpdateEvent =
+  | {
+      readonly event: "started";
+      readonly data: { readonly content_length: number | null };
+    }
+  | {
+      readonly event: "progress";
+      readonly data: { readonly chunk_length: number };
+    }
+  | { readonly event: "finished" };
+
 export type ResearchModel =
   | "chatgpt"
   | "gemini"
@@ -40,6 +60,7 @@ export interface ResearchDraft {
   readonly id: string;
   readonly model: ResearchModel;
   readonly content: string;
+  readonly heightPx: number;
 }
 
 export interface ResearchSavedFile {

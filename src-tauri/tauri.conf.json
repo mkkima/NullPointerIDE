@@ -34,6 +34,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "category": "DeveloperTool",
     "shortDescription": "A fast, focused code editor",
     "longDescription": "NullPointer is a minimal native code editor optimized for focus and speed.",
@@ -44,5 +45,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ0MDAzRUMxODA2NzM4MjIKUldRaU9HZUF3VDRBUkJkZnR4cjJ3SVlxRTh1elFsellIZi9oY0RxMVFMeUpzSU8zRHpGTC9kNUMK",
+      "endpoints": [
+        "https://github.com/mkkima/NullPointerIDE/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
