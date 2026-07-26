@@ -59,8 +59,83 @@ jobs:
           releaseName: NullPointer v__VERSION__
           releaseBody: |
             Automatic build from `${{ github.sha }}`.
+            Includes a Windows x64 installer, Windows portable ZIP, and macOS Apple Silicon DMG.
             Installed copies of NullPointer will receive this update automatically.
           releaseDraft: false
           prerelease: false
           releaseCommitish: ${{ github.sha }}
+          updaterJsonPreferNsis: true
+
+      - name: Package portable Windows build
+        shell: pwsh
+        run: |
+          $binary = Resolve-Path "src-tauri\target\release\nullpointer-ide.exe"
+          $package = Join-Path $env:RUNNER_TEMP "NullPointer-Portable"
+          $archive = Join-Path $env:RUNNER_TEMP "NullPointer_${env:APP_VERSION}_windows_x64_portable.zip"
+
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item -LiteralPath $binary -Destination (Join-Path $package "NullPointer.exe")
+          Copy-Item -LiteralPath "packaging\portable\portable.flag" -Destination $package
+          Copy-Item -LiteralPath "packaging\portable\README.txt" -Destination $package
+          Compress-Archive -LiteralPath $package -DestinationPath $archive -CompressionLevel Optimal
+
+          "PORTABLE_ARCHIVE=$archive" >> $env:GITHUB_ENV
+
+      - name: Publish portable Windows build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "app-v$env:APP_VERSION" `
+            "$env:PORTABLE_ARCHIVE#NullPointer Portable for Windows x64" `
+            --clobber
+
+  release-macos:
+    name: Build and publish macOS Apple Silicon update
+    needs: release-windows
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust for Apple Silicon
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Generate automatic release version
+        run: |
+          version="0.${{ github.run_number }}.${{ github.run_attempt }}"
+          node scripts/set-release-version.mjs "$version"
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build, ad-hoc sign and publish Apple Silicon release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          tagName: app-v__VERSION__
+          releaseName: NullPointer v__VERSION__
+          releaseBody: |
+            Automatic build from `${{ github.sha }}`.
+            Includes a Windows x64 installer, Windows portable ZIP, and macOS Apple Silicon DMG.
+            Installed copies of NullPointer will receive this update automatically.
+          releaseDraft: false
+          prerelease: false
+          releaseCommitish: ${{ github.sha }}
+          args: --target aarch64-apple-darwin --bundles app,dmg
           updaterJsonPreferNsis: true

@@ -2,6 +2,7 @@ import "@fontsource-variable/inter";
 import "./styles/main.css";
 import { EditorController } from "./editor/controller";
 import { ResearchController } from "./research/controller";
+import { TerminalController } from "./terminal/controller";
 import { checkAndInstallUpdate } from "./services/updater";
 import { UpdatesController } from "./updates/controller";
 import {
@@ -112,6 +113,7 @@ class NullPointerApp {
   private readonly entryError = element<HTMLElement>("#entry-error");
   private readonly editor: EditorController;
   private readonly research: ResearchController;
+  private readonly terminal: TerminalController;
   private readonly updates: UpdatesController;
 
   private project: ProjectSnapshot | null = null;
@@ -158,6 +160,14 @@ class NullPointerApp {
       onBusy: (busy, message) => this.setBusy(busy, message),
       onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
     });
+    this.terminal = new TerminalController(
+      this.shell,
+      element<HTMLElement>("#terminal-panel"),
+      {
+        getCwd: () => this.project?.rootPath ?? null,
+        onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
+      },
+    );
     this.updates = new UpdatesController(this.updatesView, {
       canInstall: () =>
         this.dirty.size === 0 &&
@@ -178,8 +188,9 @@ class NullPointerApp {
   start(): void {
     this.removeStorage(LEGACY_LAST_PROJECT_KEY);
     void this.research.restore();
-    void this.updates.start();
-    window.setTimeout(() => void this.checkForUpdates(), 1_200);
+    void this.updates.start().then(() => {
+      window.setTimeout(() => void this.checkForUpdates(), 1_200);
+    });
     window.setInterval(
       () => void this.checkForUpdates(),
       UPDATE_CHECK_INTERVAL_MS,
@@ -1864,6 +1875,7 @@ class NullPointerApp {
   }
 
   private handleGlobalKeydown(event: KeyboardEvent): void {
+    if (this.terminal.handleGlobalKeydown(event)) return;
     const command = event.ctrlKey || event.metaKey;
     if (!command) return;
     const key = event.key.toLowerCase();
@@ -2249,7 +2261,7 @@ element<HTMLElement>("#app").innerHTML = `
 
         <div class="update-security-note">
           ${icon("check", 15)}
-          <span>Every installer is verified with the app signing key before it can run.</span>
+          <span id="update-security-copy">Every installer is verified with the app signing key before it can run.</span>
         </div>
 
         <div class="update-install-progress hidden" id="update-progress" role="status" aria-live="polite">
@@ -2359,8 +2371,105 @@ element<HTMLElement>("#app").innerHTML = `
       </section>
     </main>
 
+    <section class="terminal-panel" id="terminal-panel" aria-label="Integrated terminal" aria-hidden="true">
+      <div class="terminal-resizer" id="terminal-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize terminal"></div>
+      <header class="terminal-toolbar">
+        <div class="terminal-heading">
+          <strong>Terminal</strong>
+          <span class="terminal-shortcut">Ctrl &#96;</span>
+        </div>
+        <div class="terminal-tabs" id="terminal-tabs" role="tablist" aria-label="Terminal sessions"></div>
+        <div class="terminal-actions">
+          <div class="terminal-search hidden" id="terminal-search">
+            ${icon("search", 14)}
+            <input id="terminal-search-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find" aria-label="Find in terminal" />
+            <span>Enter</span>
+          </div>
+          <div class="terminal-shell-picker" id="terminal-shell-picker">
+            <button
+              class="terminal-shell-trigger"
+              id="terminal-shell-trigger"
+              type="button"
+              data-terminal-action="shell-menu"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="terminal-shell-menu"
+              title="Shell for new terminals"
+            >
+              <span id="terminal-shell-label">PowerShell</span>
+              ${icon("chevron-down", 13)}
+            </button>
+            <div class="terminal-shell-menu" id="terminal-shell-menu" role="listbox" aria-label="Shell for new terminals" aria-hidden="true">
+              <button type="button" role="option" data-terminal-shell="powershell-core"><span>PowerShell</span>${icon("check", 13)}</button>
+              <button type="button" role="option" data-terminal-shell="windows-powershell"><span>Windows PowerShell</span>${icon("check", 13)}</button>
+              <button type="button" role="option" data-terminal-shell="command-prompt"><span>Command Prompt</span>${icon("check", 13)}</button>
+              <button type="button" role="option" data-terminal-shell="default"><span>Default shell</span>${icon("check", 13)}</button>
+              <button type="button" role="option" data-terminal-shell="bash"><span>Bash</span>${icon("check", 13)}</button>
+              <button type="button" role="option" data-terminal-shell="zsh"><span>Zsh</span>${icon("check", 13)}</button>
+            </div>
+          </div>
+          <button class="terminal-action" type="button" data-terminal-action="new" title="New terminal (Ctrl+Shift+&#96;)" aria-label="New terminal">
+            ${icon("plus", 16)}
+          </button>
+          <button class="terminal-action" id="terminal-search-button" type="button" data-terminal-action="search" title="Find (Ctrl+F)" aria-label="Find in terminal">
+            ${icon("search", 16)}
+          </button>
+          <button class="terminal-action" type="button" data-terminal-action="clear" title="Clear terminal" aria-label="Clear terminal">
+            ${icon("eraser", 16)}
+          </button>
+          <button class="terminal-action" type="button" data-terminal-action="restart" title="Restart terminal" aria-label="Restart terminal">
+            ${icon("refresh", 16)}
+          </button>
+          <button class="terminal-action" id="terminal-settings-button" type="button" data-terminal-action="settings" title="Terminal settings" aria-label="Terminal settings">
+            ${icon("settings", 16)}
+          </button>
+          <button class="terminal-action" type="button" data-terminal-action="maximize" title="Maximize panel" aria-label="Maximize panel">
+            ${icon("maximize", 15)}
+          </button>
+          <button class="terminal-action" type="button" data-terminal-action="close" title="Kill active terminal" aria-label="Kill active terminal">
+            ${icon("trash", 15)}
+          </button>
+          <button class="terminal-action" type="button" data-terminal-action="collapse" title="Hide terminal" aria-label="Hide terminal">
+            ${icon("chevron-down", 16)}
+          </button>
+        </div>
+      </header>
+      <div class="terminal-views" id="terminal-views"></div>
+      <div class="terminal-settings" id="terminal-settings" popover="manual">
+        <header><strong>Terminal settings</strong><small>Saved automatically</small></header>
+        <div class="terminal-setting-row">
+          <span><strong>Font size</strong><small>Terminal text only</small></span>
+          <div class="terminal-font-stepper">
+            <button type="button" data-terminal-action="font-smaller" aria-label="Decrease terminal font">${icon("minus", 13)}</button>
+            <output id="terminal-font-size-value">13px</output>
+            <button type="button" data-terminal-action="font-larger" aria-label="Increase terminal font">${icon("plus", 13)}</button>
+          </div>
+        </div>
+        <label class="terminal-setting-row">
+          <span><strong>Cursor</strong><small>Shape of the caret</small></span>
+          <select id="terminal-cursor-style">
+            <option value="block">Block</option>
+            <option value="bar">Bar</option>
+            <option value="underline">Underline</option>
+          </select>
+        </label>
+        <label class="terminal-setting-row">
+          <span><strong>Scrollback</strong><small>Lines kept in memory</small></span>
+          <select id="terminal-scrollback">
+            <option value="1000">1,000</option>
+            <option value="5000">5,000</option>
+            <option value="10000">10,000</option>
+            <option value="50000">50,000</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
     <footer class="statusbar">
       <span class="status-main" id="general-status">Ready</span>
+      <button class="terminal-status-button" id="terminal-status-button" type="button" aria-expanded="false">
+        ${icon("terminal", 14)}<span>Terminal</span><b id="terminal-status-count"></b>
+      </button>
       <span id="cursor-status">Ln —, Col —</span>
       <span>UTF-8</span>
       <span id="language-status">Plain Text</span>

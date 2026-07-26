@@ -1,4 +1,5 @@
 mod git;
+mod terminal;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,6 +30,8 @@ const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/mkkima/NullPointerIDE/releases?per_page=20";
 const GITHUB_RELEASE_RESPONSE_LIMIT: u64 = 2 * 1024 * 1024;
 const UPDATE_MANIFEST_NAME: &str = "latest.json";
+const PORTABLE_MARKER_NAME: &str = "portable.flag";
+const PORTABLE_DATA_DIRECTORY: &str = "data";
 
 type CommandResult<T> = Result<T, CommandError>;
 
@@ -56,6 +59,39 @@ struct AppState {
 #[derive(Default)]
 struct UpdateState {
     installing: AtomicBool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuntimeMode {
+    portable_root: Option<PathBuf>,
+}
+
+impl RuntimeMode {
+    fn detect() -> Self {
+        #[cfg(windows)]
+        {
+            let portable_root = std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(portable_root_for_executable);
+            Self { portable_root }
+        }
+
+        #[cfg(not(windows))]
+        {
+            Self::default()
+        }
+    }
+
+    fn is_portable(&self) -> bool {
+        self.portable_root.is_some()
+    }
+
+    fn data_directory(&self) -> Option<PathBuf> {
+        self.portable_root
+            .as_ref()
+            .map(|root| root.join(PORTABLE_DATA_DIRECTORY))
+    }
 }
 
 struct UpdateInstallGuard<'a>(&'a AtomicBool);
@@ -284,6 +320,11 @@ fn is_production_build() -> bool {
 }
 
 #[tauri::command]
+fn is_portable_build(mode: State<'_, RuntimeMode>) -> bool {
+    mode.is_portable()
+}
+
+#[tauri::command]
 async fn list_app_releases() -> CommandResult<Vec<AppRelease>> {
     ensure_tls_provider();
     let client = reqwest::Client::builder()
@@ -359,12 +400,19 @@ async fn install_app_version(
     version: String,
     on_event: Channel<AppUpdateEvent>,
     app: AppHandle,
-    state: State<'_, UpdateState>,
+    update_state: State<'_, UpdateState>,
+    runtime_mode: State<'_, RuntimeMode>,
 ) -> CommandResult<()> {
     if cfg!(debug_assertions) {
         return Err(CommandError::new(
             "production_only",
             "Version installation is available only in a packaged production build.",
+        ));
+    }
+    if runtime_mode.is_portable() {
+        return Err(CommandError::new(
+            "portable_update_unsupported",
+            "Portable builds are updated by replacing the application folder with a newer portable release.",
         ));
     }
 
@@ -374,7 +422,7 @@ async fn install_app_version(
             "The selected application version is invalid.",
         )
     })?;
-    if state
+    if update_state
         .installing
         .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
         .is_err()
@@ -384,7 +432,7 @@ async fn install_app_version(
             "Another application update is already in progress.",
         ));
     }
-    let _guard = UpdateInstallGuard(&state.installing);
+    let _guard = UpdateInstallGuard(&update_state.installing);
 
     let endpoint = update_manifest_url(&requested)?;
     let selected = requested.clone();
@@ -625,8 +673,11 @@ fn create_project_entry(
 }
 
 #[tauri::command]
-async fn load_research_state(app: AppHandle) -> CommandResult<Option<ResearchWorkspaceState>> {
-    let path = research_state_path(&app)?;
+async fn load_research_state(
+    app: AppHandle,
+    runtime_mode: State<'_, RuntimeMode>,
+) -> CommandResult<Option<ResearchWorkspaceState>> {
+    let path = research_state_path(&app, &runtime_mode)?;
     run_io_task(move || {
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -668,9 +719,10 @@ async fn load_research_state(app: AppHandle) -> CommandResult<Option<ResearchWor
 async fn save_research_state(
     research_state: ResearchWorkspaceState,
     app: AppHandle,
+    runtime_mode: State<'_, RuntimeMode>,
 ) -> CommandResult<()> {
     validate_research_state(&research_state)?;
-    let path = research_state_path(&app)?;
+    let path = research_state_path(&app, &runtime_mode)?;
     run_io_task(move || {
         let parent = path.parent().ok_or_else(|| {
             CommandError::new(
@@ -934,17 +986,27 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn research_state_path(app: &AppHandle) -> CommandResult<PathBuf> {
-    let directory = app.path().app_data_dir().map_err(|error| {
-        CommandError::new(
-            "research_state_path_error",
-            format!("Could not locate the application data directory: {error}"),
-        )
-    })?;
+fn research_state_path(app: &AppHandle, runtime_mode: &RuntimeMode) -> CommandResult<PathBuf> {
+    let directory = match runtime_mode.data_directory() {
+        Some(directory) => directory,
+        None => app.path().app_data_dir().map_err(|error| {
+            CommandError::new(
+                "research_state_path_error",
+                format!("Could not locate the application data directory: {error}"),
+            )
+        })?,
+    };
     fs::create_dir_all(&directory).map_err(|error| {
-        CommandError::io("Could not create the application data directory", error)
+        CommandError::io("Could not create the application state directory", error)
     })?;
     Ok(directory.join("research-state.json"))
+}
+
+fn portable_root_for_executable(executable: &Path) -> Option<PathBuf> {
+    let root = executable.parent()?;
+    root.join(PORTABLE_MARKER_NAME)
+        .is_file()
+        .then(|| root.to_path_buf())
 }
 
 fn validate_research_state(state: &ResearchWorkspaceState) -> CommandResult<()> {
@@ -1359,14 +1421,39 @@ fn path_to_display_string(path: &Path) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let runtime_mode = RuntimeMode::detect();
+    let portable_webview_directory = runtime_mode
+        .data_directory()
+        .map(|directory| directory.join("webview"));
+    let mut context = tauri::generate_context!();
+    if portable_webview_directory.is_some() {
+        for window in &mut context.config_mut().app.windows {
+            window.create = false;
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(move |app| {
+            if let Some(data_directory) = portable_webview_directory {
+                let window_config = app.config().app.windows.first().cloned().ok_or_else(|| {
+                    std::io::Error::other("Portable mode requires a configured application window.")
+                })?;
+                tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+                    .data_directory(data_directory)
+                    .build()?;
+            }
+            Ok(())
+        })
         .manage(AppState::default())
+        .manage(terminal::TerminalManager::default())
         .manage(UpdateState::default())
+        .manage(runtime_mode)
         .invoke_handler(tauri::generate_handler![
             is_production_build,
+            is_portable_build,
             list_app_releases,
             install_app_version,
             open_project,
@@ -1381,9 +1468,13 @@ pub fn run() {
             git_stage_file,
             git_unstage_file,
             git_stage_all,
-            git_commit_repository
+            git_commit_repository,
+            terminal::terminal_start,
+            terminal::terminal_write,
+            terminal::terminal_resize,
+            terminal::terminal_kill
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("failed to run NullPointer IDE");
 }
 
@@ -1411,6 +1502,21 @@ mod tests {
             "/secret.txt"
         };
         assert!(normalize_relative(absolute).is_err());
+    }
+
+    #[test]
+    fn detects_portable_layout_only_when_marker_is_next_to_executable() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let executable = directory.path().join("NullPointer.exe");
+        fs::write(&executable, b"fixture").expect("fixture executable should be written");
+        assert_eq!(portable_root_for_executable(&executable), None);
+
+        fs::write(directory.path().join(PORTABLE_MARKER_NAME), b"portable")
+            .expect("portable marker should be written");
+        assert_eq!(
+            portable_root_for_executable(&executable),
+            Some(directory.path().to_path_buf())
+        );
     }
 
     #[test]

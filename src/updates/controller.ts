@@ -1,6 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import {
   installAppVersion,
+  isPortableBuild,
   isProductionBuild,
   listAppReleases,
   toAppError,
@@ -85,6 +86,7 @@ export class UpdatesController {
   private readonly summaryStatus: HTMLElement;
   private readonly automaticToggle: HTMLInputElement;
   private readonly automaticCaption: HTMLElement;
+  private readonly securityCopy: HTMLElement;
   private readonly lastCheckedLabel: HTMLElement;
   private readonly progress: HTMLElement;
   private readonly progressLabel: HTMLElement;
@@ -94,6 +96,8 @@ export class UpdatesController {
   private automatic = this.readAutomaticPreference();
   private currentVersion: string | null = null;
   private productionBuild = false;
+  private portableBuild = true;
+  private runtimeReady = false;
   private releases: readonly AppRelease[] = [];
   private releasesLoaded = false;
   private releasesLoading = false;
@@ -107,6 +111,7 @@ export class UpdatesController {
   private rollbackTimer: number | null = null;
   private initialization: Promise<void> | null = null;
   private progressFrame: number | null = null;
+  private readonly expandedReleaseNotes = new Set<string>();
 
   constructor(
     private readonly root: HTMLElement,
@@ -116,6 +121,7 @@ export class UpdatesController {
     this.summaryStatus = required(root, "#update-summary-status");
     this.automaticToggle = required(root, "#update-auto-toggle");
     this.automaticCaption = required(root, "#update-auto-caption");
+    this.securityCopy = required(root, "#update-security-copy");
     this.lastCheckedLabel = required(root, "#update-last-checked");
     this.progress = required(root, "#update-progress");
     this.progressLabel = required(root, "#update-progress-label");
@@ -140,7 +146,7 @@ export class UpdatesController {
   }
 
   automaticUpdatesEnabled(): boolean {
-    return this.automatic;
+    return this.runtimeReady && this.automatic && !this.portableBuild;
   }
 
   async refresh(): Promise<void> {
@@ -165,15 +171,23 @@ export class UpdatesController {
 
   private ensureInitialized(): Promise<void> {
     if (this.initialization) return this.initialization;
-    this.initialization = Promise.all([getVersion(), isProductionBuild()])
-      .then(([version, production]) => {
+    this.initialization = Promise.all([
+      getVersion(),
+      isProductionBuild(),
+      isPortableBuild(),
+    ])
+      .then(([version, production, portable]) => {
         this.currentVersion = version;
         this.productionBuild = production;
+        this.portableBuild = portable;
       })
       .catch((error: unknown) => {
         this.releasesError = toAppError(error).message;
       })
-      .finally(() => this.render());
+      .finally(() => {
+        this.runtimeReady = true;
+        this.render();
+      });
     return this.initialization;
   }
 
@@ -198,6 +212,10 @@ export class UpdatesController {
         void this.refresh();
         return;
       }
+      if (action.dataset.updateAction === "toggle-notes" && action.dataset.version) {
+        this.toggleReleaseNotes(action, action.dataset.version);
+        return;
+      }
       if (action.dataset.updateAction === "install" && action.dataset.version) {
         void this.install(action.dataset.version);
       }
@@ -205,7 +223,14 @@ export class UpdatesController {
   }
 
   private async install(version: string): Promise<void> {
-    if (this.installingVersion || !this.currentVersion || !this.productionBuild) return;
+    if (
+      this.installingVersion ||
+      !this.currentVersion ||
+      !this.productionBuild ||
+      this.portableBuild
+    ) {
+      return;
+    }
     const release = this.releases.find((candidate) => candidate.version === version);
     if (!release?.updateAvailable || version === this.currentVersion) return;
 
@@ -292,10 +317,20 @@ export class UpdatesController {
   }
 
   private renderAutomaticPreference(): void {
-    this.automaticToggle.checked = this.automatic;
-    this.automaticCaption.textContent = this.automatic
-      ? "Checks quietly every 30 minutes"
-      : "Manual checks only";
+    this.automaticToggle.disabled = !this.runtimeReady || this.portableBuild;
+    this.automaticToggle.checked = this.portableBuild ? false : this.automatic;
+    this.automaticCaption.textContent = !this.runtimeReady
+      ? "Detecting application mode…"
+      : this.portableBuild
+        ? "Replace the portable folder to update"
+        : this.automatic
+          ? "Checks quietly every 30 minutes"
+          : "Manual checks only";
+    this.securityCopy.textContent = !this.runtimeReady
+      ? "Detecting application update capabilities…"
+      : this.portableBuild
+        ? "Portable builds do not modify themselves. Download replacements only from the official GitHub Releases."
+        : "Every installer is verified with the app signing key before it can run.";
   }
 
   private renderOverview(): void {
@@ -309,7 +344,10 @@ export class UpdatesController {
             compareVersions(release.version, this.currentVersion ?? release.version) > 0,
         )
       : null;
-    if (!this.productionBuild && this.currentVersion) {
+    if (this.portableBuild && this.currentVersion) {
+      this.summaryStatus.textContent = "Portable build";
+      this.summaryStatus.dataset.tone = "neutral";
+    } else if (!this.productionBuild && this.currentVersion) {
       this.summaryStatus.textContent = "Development build";
       this.summaryStatus.dataset.tone = "neutral";
     } else if (latest) {
@@ -412,13 +450,33 @@ export class UpdatesController {
     name.className = "update-release-name";
     name.textContent = release.name;
 
-    const notes = document.createElement("details");
+    const notes = document.createElement("section");
     notes.className = "update-release-notes";
-    const summary = document.createElement("summary");
-    summary.textContent = "Release notes";
+    const notesOpen = this.expandedReleaseNotes.has(release.version);
+    notes.classList.toggle("open", notesOpen);
+    const summary = document.createElement("button");
+    summary.type = "button";
+    summary.dataset.updateAction = "toggle-notes";
+    summary.dataset.version = release.version;
+    summary.setAttribute("aria-expanded", String(notesOpen));
+    const notesId = `release-notes-${release.version.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+    summary.setAttribute("aria-controls", notesId);
+    const marker = document.createElement("span");
+    marker.className = "update-release-notes-marker";
+    marker.setAttribute("aria-hidden", "true");
+    const summaryLabel = document.createElement("span");
+    summaryLabel.textContent = "Release notes";
+    summary.append(marker, summaryLabel);
+    const content = document.createElement("div");
+    content.className = "update-release-notes-content";
+    content.id = notesId;
+    content.setAttribute("aria-hidden", String(!notesOpen));
+    const contentInner = document.createElement("div");
     const body = document.createElement("p");
     body.textContent = release.notes.trim() || "No release notes were provided.";
-    notes.append(summary, body);
+    contentInner.append(body);
+    content.append(contentInner);
+    notes.append(summary, content);
 
     const action = document.createElement("button");
     action.type = "button";
@@ -426,7 +484,13 @@ export class UpdatesController {
     const comparison = this.currentVersion
       ? compareVersions(release.version, this.currentVersion)
       : 0;
-    if (!this.productionBuild) {
+    if (!this.runtimeReady) {
+      action.textContent = "Loading…";
+      action.disabled = true;
+    } else if (this.portableBuild) {
+      action.textContent = "Portable ZIP required";
+      action.disabled = true;
+    } else if (!this.productionBuild) {
       action.textContent = "Packaged builds only";
       action.disabled = true;
     } else if (release.version === this.currentVersion) {
@@ -454,6 +518,18 @@ export class UpdatesController {
 
     card.append(header, name, notes, action);
     return card;
+  }
+
+  private toggleReleaseNotes(trigger: HTMLElement, version: string): void {
+    const notes = trigger.closest<HTMLElement>(".update-release-notes");
+    const content = notes?.querySelector<HTMLElement>(".update-release-notes-content");
+    if (!notes || !content) return;
+    const opening = !notes.classList.contains("open");
+    notes.classList.toggle("open", opening);
+    trigger.setAttribute("aria-expanded", String(opening));
+    content.setAttribute("aria-hidden", String(!opening));
+    if (opening) this.expandedReleaseNotes.add(version);
+    else this.expandedReleaseNotes.delete(version);
   }
 
   private formatReleaseDate(value: string | null): string {

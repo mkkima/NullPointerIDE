@@ -16,6 +16,27 @@ import type {
   SaveResult,
 } from "../types";
 
+export type TerminalShell =
+  | "default"
+  | "powershell-core"
+  | "windows-powershell"
+  | "command-prompt"
+  | "bash"
+  | "zsh";
+
+export type TerminalEvent =
+  | { readonly event: "output"; readonly data: string }
+  | { readonly event: "exit"; readonly code: number; readonly signal: string | null }
+  | { readonly event: "error"; readonly message: string };
+
+export interface TerminalInfo {
+  readonly id: number;
+  readonly shell: TerminalShell;
+  readonly label: string;
+  readonly cwd: string;
+  readonly processId: number | null;
+}
+
 function requireDesktopRuntime(): void {
   if (!isTauri()) {
     throw {
@@ -38,6 +59,11 @@ export async function chooseProjectFolder(): Promise<string | null> {
 export async function isProductionBuild(): Promise<boolean> {
   if (!isTauri()) return false;
   return invoke<boolean>("is_production_build");
+}
+
+export async function isPortableBuild(): Promise<boolean> {
+  if (!isTauri()) return false;
+  return invoke<boolean>("is_portable_build");
 }
 
 export async function listAppReleases(): Promise<readonly AppRelease[]> {
@@ -151,6 +177,44 @@ export async function saveResearchFiles(
     folderPath,
     entries,
   });
+}
+
+export async function startTerminal(
+  shell: TerminalShell,
+  cwd: string | null,
+  rows: number,
+  cols: number,
+  onEvent: (event: TerminalEvent) => void,
+): Promise<TerminalInfo> {
+  requireDesktopRuntime();
+  const channel = new Channel<TerminalEvent>();
+  channel.onmessage = onEvent;
+  return invoke<TerminalInfo>("terminal_start", {
+    shell,
+    cwd,
+    rows,
+    cols,
+    onEvent: channel,
+  });
+}
+
+export async function writeTerminal(id: number, data: string): Promise<void> {
+  requireDesktopRuntime();
+  return invoke<void>("terminal_write", { id, data });
+}
+
+export async function resizeTerminal(
+  id: number,
+  rows: number,
+  cols: number,
+): Promise<void> {
+  requireDesktopRuntime();
+  return invoke<void>("terminal_resize", { id, rows, cols });
+}
+
+export async function killTerminal(id: number): Promise<void> {
+  requireDesktopRuntime();
+  return invoke<void>("terminal_kill", { id });
 }
 
 export function toAppError(error: unknown): AppError {

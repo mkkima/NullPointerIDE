@@ -37,9 +37,10 @@ npm run tauri build
 ## Automatic updates
 
 Every successful push to `main` runs frontend and Rust tests, generates an internal
-version from the GitHub Actions run number, builds a signed Windows release, and
-publishes `latest.json` with the updater bundle. Installed production builds check
-for updates on startup and every 30 minutes. The **Updates** section can disable
+version from the GitHub Actions run number, and publishes Windows x64 and macOS
+Apple Silicon installers in one GitHub Release. The shared `latest.json` contains
+signed updater bundles for both platforms. Installed production builds check for
+updates on startup and every 30 minutes. The **Updates** section can disable
 automatic checks, refresh the GitHub release history, show release notes, install
 a newer version, or roll back to an older signed build. Rolling back disables
 automatic updates so the selected version is not immediately replaced.
@@ -52,6 +53,32 @@ The updater public key is committed in `src-tauri/tauri.conf.json`. The private 
 must never be committed; its local recovery copy is stored at
 `%USERPROFILE%\.tauri\nullpointer-ide.key`, and GitHub Actions reads it from the
 `TAURI_SIGNING_PRIVATE_KEY` repository secret.
+
+### Windows portable
+
+Each GitHub Release also contains
+`NullPointer_<version>_windows_x64_portable.zip`. Extract the archive and run
+`NullPointer.exe`; no installation or administrator access is required. Keep
+`portable.flag` next to the executable to store WebView2 data, preferences,
+cache, and Research state in the adjacent `data` folder.
+
+Portable builds show the release history but do not run the NSIS self-updater:
+replacing a running portable folder with an installer would stop being portable.
+To update, close NullPointer, extract the newest portable ZIP, replace the
+application files, and preserve the existing `data` folder.
+
+### macOS Apple Silicon
+
+Download the `.dmg` asset from the latest GitHub Release, open it, and drag
+`NullPointer.app` into `Applications`. The build targets Apple Silicon Macs only
+and is ad-hoc signed with `APPLE_SIGNING_IDENTITY=-`, so it does not require a
+paid Apple Developer account.
+
+Because the app is not Apple-notarized, Gatekeeper can block the first launch.
+Control-click `NullPointer.app`, choose **Open**, or allow it from **System
+Settings → Privacy & Security**. This ad-hoc signature is separate from the Tauri
+updater signature: downloaded updates are still verified against the embedded
+public updater key.
 
 ## Shortcuts
 
