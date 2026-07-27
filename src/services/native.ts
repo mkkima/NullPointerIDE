@@ -6,6 +6,7 @@ import type {
   AppUpdateEvent,
   CreateKind,
   FileDocument,
+  FileEntry,
   GitCommitAction,
   GitCommitResult,
   GitWorkspace,
@@ -14,7 +15,9 @@ import type {
   ResearchSavedFile,
   ResearchWorkspaceState,
   SaveResult,
+  WorkspaceRootSnapshot,
 } from "../types";
+import { splitWorkspaceFilePath, workspaceFilePath } from "../utils/files";
 
 export type TerminalShell =
   | "default"
@@ -37,6 +40,68 @@ export interface TerminalInfo {
   readonly processId: number | null;
 }
 
+interface NativeFileEntry {
+  readonly name: string;
+  readonly path: string;
+  readonly kind: "file" | "directory";
+  readonly isSymlink: boolean;
+  readonly children: readonly NativeFileEntry[];
+}
+
+interface NativeWorkspaceRoot {
+  readonly id: string;
+  readonly rootPath: string;
+  readonly name: string;
+  readonly entries: readonly NativeFileEntry[];
+  readonly truncated: boolean;
+}
+
+interface NativeWorkspaceSnapshot {
+  readonly roots: readonly NativeWorkspaceRoot[];
+}
+
+function hydrateWorkspace(snapshot: NativeWorkspaceSnapshot): ProjectSnapshot {
+  const hydrateEntry = (
+    root: NativeWorkspaceRoot,
+    entry: NativeFileEntry,
+  ): FileEntry => ({
+    name: entry.name,
+    path: workspaceFilePath(root.id, entry.path),
+    relativePath: entry.path,
+    rootId: root.id,
+    rootName: root.name,
+    kind: entry.kind,
+    isSymlink: entry.isSymlink,
+    children: entry.children.map((child) => hydrateEntry(root, child)),
+  });
+  const roots: WorkspaceRootSnapshot[] = snapshot.roots.map((root) => ({
+    id: root.id,
+    rootPath: root.rootPath,
+    name: root.name,
+    entries: root.entries.map((entry) => hydrateEntry(root, entry)),
+    truncated: root.truncated,
+  }));
+  return {
+    roots,
+    rootPath: roots[0]?.rootPath ?? "",
+    name: roots.length === 1 ? (roots[0]?.name ?? "") : `${roots.length} folders`,
+    entries: roots.flatMap((root) => root.entries),
+    truncated: roots.some((root) => root.truncated),
+  };
+}
+
+function requireWorkspaceFilePath(path: string): {
+  readonly rootId: string;
+  readonly relativePath: string;
+} {
+  const parsed = splitWorkspaceFilePath(path);
+  if (parsed) return parsed;
+  throw {
+    code: "invalid_workspace_path",
+    message: "The selected file does not belong to an open workspace folder.",
+  } satisfies AppError;
+}
+
 function requireDesktopRuntime(): void {
   if (!isTauri()) {
     throw {
@@ -46,12 +111,14 @@ function requireDesktopRuntime(): void {
   }
 }
 
-export async function chooseProjectFolder(): Promise<string | null> {
+export async function chooseProjectFolder(
+  title = "Open project folder",
+): Promise<string | null> {
   requireDesktopRuntime();
   const selection = await open({
     directory: true,
     multiple: false,
-    title: "Open project folder",
+    title,
   });
   return typeof selection === "string" ? selection : null;
 }
@@ -93,26 +160,47 @@ export async function chooseResearchFolder(): Promise<string | null> {
 
 export async function openProject(path: string): Promise<ProjectSnapshot> {
   requireDesktopRuntime();
-  return invoke<ProjectSnapshot>("open_project", { path });
+  return hydrateWorkspace(await invoke<NativeWorkspaceSnapshot>("open_project", { path }));
+}
+
+export async function addWorkspaceFolder(path: string): Promise<ProjectSnapshot> {
+  requireDesktopRuntime();
+  return hydrateWorkspace(
+    await invoke<NativeWorkspaceSnapshot>("add_workspace_folder", { path }),
+  );
+}
+
+export async function removeWorkspaceFolder(rootId: string): Promise<ProjectSnapshot> {
+  requireDesktopRuntime();
+  return hydrateWorkspace(
+    await invoke<NativeWorkspaceSnapshot>("remove_workspace_folder", { rootId }),
+  );
 }
 
 export async function refreshProject(): Promise<ProjectSnapshot> {
   requireDesktopRuntime();
-  return invoke<ProjectSnapshot>("refresh_project");
+  return hydrateWorkspace(await invoke<NativeWorkspaceSnapshot>("refresh_project"));
 }
 
-export async function readProjectFile(relativePath: string): Promise<FileDocument> {
+export async function readProjectFile(path: string): Promise<FileDocument> {
   requireDesktopRuntime();
-  return invoke<FileDocument>("read_project_file", { relativePath });
+  const { rootId, relativePath } = requireWorkspaceFilePath(path);
+  const document = await invoke<FileDocument>("read_project_file", {
+    rootId,
+    relativePath,
+  });
+  return { ...document, path };
 }
 
 export async function writeProjectFile(
-  relativePath: string,
+  path: string,
   content: string,
   expectedModifiedAtMs: number,
 ): Promise<SaveResult> {
   requireDesktopRuntime();
+  const { rootId, relativePath } = requireWorkspaceFilePath(path);
   return invoke<SaveResult>("write_project_file", {
+    rootId,
     relativePath,
     content,
     expectedModifiedAtMs,
@@ -120,11 +208,18 @@ export async function writeProjectFile(
 }
 
 export async function createProjectEntry(
+  rootId: string,
   relativePath: string,
   kind: CreateKind,
 ): Promise<ProjectSnapshot> {
   requireDesktopRuntime();
-  return invoke<ProjectSnapshot>("create_project_entry", { relativePath, kind });
+  return hydrateWorkspace(
+    await invoke<NativeWorkspaceSnapshot>("create_project_entry", {
+      rootId,
+      relativePath,
+      kind,
+    }),
+  );
 }
 
 export async function getGitWorkspace(): Promise<GitWorkspace> {

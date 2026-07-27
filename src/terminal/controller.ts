@@ -73,10 +73,20 @@ interface TerminalSession {
   pendingInput: string[];
   writingInput: boolean;
   resizeTimer: number | null;
+  cwd: string | null;
+}
+
+export interface TerminalWorkspaceFolder {
+  readonly id: string;
+  readonly name: string;
+  readonly path: string;
 }
 
 interface TerminalCallbacks {
   readonly getCwd: () => string | null;
+  readonly getWorkspaceFolders: () => readonly TerminalWorkspaceFolder[];
+  readonly getActiveWorkspaceFolderId: () => string | null;
+  readonly onWorkspaceFolderSelected: (id: string) => void;
   readonly onToast: (
     message: string,
     tone: "success" | "warning" | "error" | "neutral",
@@ -155,6 +165,10 @@ export class TerminalController {
   private readonly shellTrigger: HTMLButtonElement;
   private readonly shellMenu: HTMLElement;
   private readonly shellLabelElement: HTMLElement;
+  private readonly cwdPicker: HTMLElement;
+  private readonly cwdTrigger: HTMLButtonElement;
+  private readonly cwdMenu: HTMLElement;
+  private readonly cwdLabel: HTMLElement;
   private readonly searchWrap: HTMLElement;
   private readonly searchInput: HTMLInputElement;
   private readonly settingsPopover: HTMLElement;
@@ -188,6 +202,10 @@ export class TerminalController {
     this.shellTrigger = required(panel, "#terminal-shell-trigger");
     this.shellMenu = required(panel, "#terminal-shell-menu");
     this.shellLabelElement = required(panel, "#terminal-shell-label");
+    this.cwdPicker = required(panel, "#terminal-cwd-picker");
+    this.cwdTrigger = required(panel, "#terminal-cwd-trigger");
+    this.cwdMenu = required(panel, "#terminal-cwd-menu");
+    this.cwdLabel = required(panel, "#terminal-cwd-label");
     this.searchWrap = required(panel, "#terminal-search");
     this.searchInput = required(panel, "#terminal-search-input");
     this.settingsPopover = required(panel, "#terminal-settings");
@@ -202,6 +220,40 @@ export class TerminalController {
     this.resizeObserver = new ResizeObserver(() => this.scheduleFit());
     this.resizeObserver.observe(this.views);
     this.sync();
+    this.syncWorkspaceFolders();
+  }
+
+  syncWorkspaceFolders(): void {
+    const folders = this.callbacks.getWorkspaceFolders();
+    const activeId = this.callbacks.getActiveWorkspaceFolderId();
+    this.cwdPicker.classList.toggle("hidden", folders.length <= 1);
+    const active = folders.find((folder) => folder.id === activeId) ?? folders[0];
+    this.cwdLabel.textContent = active?.name ?? "Workspace folder";
+    this.cwdTrigger.title = active
+      ? `New terminals start in ${active.path}`
+      : "Working folder for new terminals";
+
+    const fragment = document.createDocumentFragment();
+    for (const folder of folders) {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.dataset.terminalRoot = folder.id;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", String(folder.id === active?.id));
+      option.classList.toggle("selected", folder.id === active?.id);
+      option.title = folder.path;
+      const label = document.createElement("span");
+      label.textContent = folder.name;
+      option.append(label);
+      if (folder.id === active?.id) {
+        const selected = document.createElement("span");
+        selected.innerHTML = icon("check", 13);
+        option.append(selected);
+      }
+      fragment.append(option);
+    }
+    this.cwdMenu.replaceChildren(fragment);
+    if (folders.length <= 1) this.hideCwdMenu();
   }
 
   handleGlobalKeydown(event: KeyboardEvent): boolean {
@@ -308,6 +360,7 @@ export class TerminalController {
       pendingInput: [],
       writingInput: false,
       resizeTimer: null,
+      cwd: null,
     };
     this.enteringClientIds.add(clientId);
     this.sessions.push(session);
@@ -362,6 +415,7 @@ export class TerminalController {
         return;
       }
       session.backendId = info.id;
+      session.cwd = info.cwd;
       session.label = info.label;
       this.renderTabs();
       void this.flushInput(session);
@@ -397,6 +451,7 @@ export class TerminalController {
 
     session.exited = true;
     session.backendId = null;
+    session.cwd = null;
     const detail = event.signal ? ` (${event.signal})` : "";
     session.terminal.writeln(
       `\r\n\x1b[90mProcess exited with code ${event.code}${detail}. Use Restart to run it again.\x1b[0m`,
@@ -525,6 +580,7 @@ export class TerminalController {
     this.hideSearch();
     this.hideSettings();
     this.hideShellMenu();
+    this.hideCwdMenu();
     this.panelCloseTimer = window.setTimeout(() => {
       this.panelCloseTimer = null;
       this.panel.classList.remove("closing");
@@ -729,6 +785,14 @@ export class TerminalController {
         this.shellTrigger.focus();
         return;
       }
+      const rootOption = target.closest<HTMLButtonElement>("[data-terminal-root]");
+      if (rootOption?.dataset.terminalRoot) {
+        this.callbacks.onWorkspaceFolderSelected(rootOption.dataset.terminalRoot);
+        this.syncWorkspaceFolders();
+        this.hideCwdMenu();
+        this.cwdTrigger.focus();
+        return;
+      }
       const action = target.closest<HTMLElement>("[data-terminal-action]")?.dataset
         .terminalAction;
       switch (action) {
@@ -759,6 +823,9 @@ export class TerminalController {
         case "shell-menu":
           this.toggleShellMenu();
           break;
+        case "cwd-menu":
+          this.toggleCwdMenu();
+          break;
         case "font-smaller":
           this.updateFontSize(this.settings.fontSize - 1);
           break;
@@ -781,6 +848,31 @@ export class TerminalController {
       queueMicrotask(() => {
         if (!this.shellPicker.contains(document.activeElement)) this.hideShellMenu();
       });
+    });
+    this.cwdPicker.addEventListener("focusout", () => {
+      queueMicrotask(() => {
+        if (!this.cwdPicker.contains(document.activeElement)) this.hideCwdMenu();
+      });
+    });
+    this.cwdTrigger.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && this.cwdMenu.classList.contains("open")) {
+        event.preventDefault();
+        this.hideCwdMenu();
+      } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        this.showCwdMenu();
+        this.focusMenuOption(this.cwdMenu, event.key === "ArrowDown" ? 0 : -1);
+      }
+    });
+    this.cwdMenu.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.hideCwdMenu();
+        this.cwdTrigger.focus();
+      } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        this.focusMenuOption(this.cwdMenu, event.key === "ArrowDown" ? 1 : -1);
+      }
     });
     this.shellMenu.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
@@ -829,6 +921,7 @@ export class TerminalController {
           this.hideSettings();
         }
         if (!this.shellPicker.contains(target)) this.hideShellMenu();
+        if (!this.cwdPicker.contains(target)) this.hideCwdMenu();
         if (
           !this.searchWrap.classList.contains("hidden") &&
           !this.searchWrap.contains(target) &&
@@ -853,6 +946,7 @@ export class TerminalController {
       tab.className = "terminal-tab";
       tab.dataset.terminalTab = String(session.clientId);
       tab.title = session.label;
+      if (session.cwd) tab.title = `${session.label}\n${session.cwd}`;
       tab.classList.toggle("active", session.clientId === this.activeClientId);
       tab.classList.toggle("exited", session.exited);
       tab.classList.toggle("entering", this.enteringClientIds.has(session.clientId));
@@ -904,8 +998,14 @@ export class TerminalController {
     else this.showShellMenu();
   }
 
+  private toggleCwdMenu(): void {
+    if (this.cwdMenu.classList.contains("open")) this.hideCwdMenu();
+    else this.showCwdMenu();
+  }
+
   private showShellMenu(): void {
     this.hideSettings();
+    this.hideCwdMenu();
     this.shellMenu.classList.add("open");
     this.shellMenu.setAttribute("aria-hidden", "false");
     this.shellTrigger.setAttribute("aria-expanded", "true");
@@ -915,6 +1015,40 @@ export class TerminalController {
     this.shellMenu.classList.remove("open");
     this.shellMenu.setAttribute("aria-hidden", "true");
     this.shellTrigger.setAttribute("aria-expanded", "false");
+  }
+
+  private showCwdMenu(): void {
+    if (this.callbacks.getWorkspaceFolders().length === 0) return;
+    this.hideSettings();
+    this.hideShellMenu();
+    this.cwdMenu.classList.add("open");
+    this.cwdMenu.setAttribute("aria-hidden", "false");
+    this.cwdTrigger.setAttribute("aria-expanded", "true");
+  }
+
+  private hideCwdMenu(): void {
+    this.cwdMenu.classList.remove("open");
+    this.cwdMenu.setAttribute("aria-hidden", "true");
+    this.cwdTrigger.setAttribute("aria-expanded", "false");
+  }
+
+  private focusMenuOption(menu: HTMLElement, offset: number): void {
+    const options = [...menu.querySelectorAll<HTMLButtonElement>("button")];
+    if (options.length === 0) return;
+    const focused =
+      document.activeElement instanceof HTMLButtonElement
+        ? options.indexOf(document.activeElement)
+        : -1;
+    const selected = options.findIndex((option) => option.classList.contains("selected"));
+    const index =
+      focused < 0
+        ? selected >= 0
+          ? selected
+          : offset < 0
+            ? options.length - 1
+            : 0
+        : (focused + offset + options.length) % options.length;
+    options[index]?.focus();
   }
 
   private focusShellOption(offset: number): void {

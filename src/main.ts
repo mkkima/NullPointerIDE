@@ -6,6 +6,7 @@ import { TerminalController } from "./terminal/controller";
 import { checkAndInstallUpdate } from "./services/updater";
 import { UpdatesController } from "./updates/controller";
 import {
+  addWorkspaceFolder,
   chooseProjectFolder,
   createProjectEntry,
   getGitWorkspace,
@@ -16,6 +17,7 @@ import {
   openProject,
   readProjectFile,
   refreshProject,
+  removeWorkspaceFolder,
   toAppError,
   writeProjectFile,
 } from "./services/native";
@@ -27,13 +29,16 @@ import type {
   GitRepository,
   GitWorkspace,
   ProjectSnapshot,
+  WorkspaceRootSnapshot,
 } from "./types";
 import {
   basename,
   extension,
   findQuickOpenMatches,
   languageName,
+  splitWorkspaceFilePath,
   validateNewPath,
+  workspaceFilePath,
 } from "./utils/files";
 import { icon, type IconName } from "./ui/icons";
 
@@ -120,6 +125,7 @@ class NullPointerApp {
   private gitWorkspace: GitWorkspace | null = null;
   private gitError: string | null = null;
   private readonly expanded = new Set<string>();
+  private readonly expandedWorkspaceRoots = new Set<string>();
   private readonly collapsedRepositories = new Set<string>();
   private readonly collapsedGitGroups = new Set<string>();
   private readonly commitMessages = new Map<string, string>();
@@ -140,6 +146,7 @@ class NullPointerApp {
   private createKind: CreateKind = "file";
   private busyCount = 0;
   private projectGeneration = 0;
+  private activeRootId: string | null = null;
   private updateCheckInFlight = false;
   private deferredUpdateVersion: string | null = null;
   private readonly treeAnimationGenerations = new Map<string, number>();
@@ -164,7 +171,15 @@ class NullPointerApp {
       this.shell,
       element<HTMLElement>("#terminal-panel"),
       {
-        getCwd: () => this.project?.rootPath ?? null,
+        getCwd: () => this.activeWorkspaceRoot()?.rootPath ?? null,
+        getWorkspaceFolders: () =>
+          this.project?.roots.map((root) => ({
+            id: root.id,
+            name: root.name,
+            path: root.rootPath,
+          })) ?? [],
+        getActiveWorkspaceFolderId: () => this.activeRootId,
+        onWorkspaceFolderSelected: (rootId) => this.setActiveWorkspaceRoot(rootId),
         onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
       },
     );
@@ -283,6 +298,9 @@ class NullPointerApp {
       this.toggleSidebar();
     });
     this.saveButton.addEventListener("click", () => void this.saveActive());
+    element<HTMLButtonElement>("#add-workspace-folder-button").addEventListener("click", () => {
+      void this.chooseAndAddWorkspaceFolder();
+    });
     this.newEntryButton.addEventListener("click", () => this.showEntryDialog());
     this.refreshButton.addEventListener("click", () => void this.refreshTree());
     this.scmRefreshButton.addEventListener("click", () => void this.refreshGit());
@@ -390,6 +408,43 @@ class NullPointerApp {
     }
   }
 
+  private async chooseAndAddWorkspaceFolder(): Promise<void> {
+    if (!this.project) {
+      await this.chooseAndOpenProject();
+      return;
+    }
+    try {
+      const path = await chooseProjectFolder("Add folder to workspace");
+      if (!path) return;
+      const previousIds = new Set(this.project.roots.map((root) => root.id));
+      this.setBusy(true, "Adding workspace folder…");
+      const snapshot = await addWorkspaceFolder(path);
+      const added = snapshot.roots.find((root) => !previousIds.has(root.id));
+      this.project = snapshot.roots.length > 0 ? snapshot : null;
+      if (added) {
+        this.activeRootId = added.id;
+        this.expandedWorkspaceRoots.add(added.id);
+      }
+      this.syncWorkspaceIdentity();
+      this.renderTree();
+      this.renderTabs();
+      this.syncChrome();
+      if (added) {
+        this.toast(`Added ${added.name} to workspace`, "success", 2200);
+        if (added.truncated) {
+          this.toast(`${added.name} was capped at 20,000 entries.`, "warning", 5000);
+        }
+        void this.refreshGit(true);
+      } else {
+        this.toast("That folder is already in the workspace", "neutral", 1800);
+      }
+    } catch (error) {
+      this.showError(error);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
   private async loadProject(path: string, announce: boolean): Promise<void> {
     this.setBusy(true, "Opening project…");
     try {
@@ -406,17 +461,17 @@ class NullPointerApp {
       this.dirty.clear();
       this.expanded.clear();
       this.treeAnimationGenerations.clear();
-      this.projectName.textContent = snapshot.name;
-      this.projectPath.textContent = snapshot.rootPath;
-      this.projectPath.title = snapshot.rootPath;
-      document.title = `${snapshot.name} — NullPointer`;
+      this.expandedWorkspaceRoots.clear();
+      for (const root of snapshot.roots) this.expandedWorkspaceRoots.add(root.id);
+      this.activeRootId = snapshot.roots[0]?.id ?? null;
+      this.syncWorkspaceIdentity();
       this.renderTree();
       this.renderTabs();
       this.renderGit();
       this.syncChrome();
       if (this.sidebarView === "source-control") void this.refreshGit(true);
       if (snapshot.truncated) {
-        this.toast("Project tree was capped at 20,000 entries.", "warning", 5000);
+        this.toast("A workspace folder was capped at 20,000 entries.", "warning", 5000);
       } else if (announce) {
         this.toast(`Opened ${snapshot.name}`, "success");
       }
@@ -430,8 +485,123 @@ class NullPointerApp {
     this.setBusy(true, "Refreshing files…");
     try {
       this.project = await refreshProject();
+      if (this.project.roots.length === 0) this.project = null;
+      if (!this.activeWorkspaceRoot()) {
+        this.activeRootId = this.project?.roots[0]?.id ?? null;
+      }
+      this.syncWorkspaceIdentity();
       this.renderTree();
       this.toast("Explorer refreshed", "success", 1800);
+    } catch (error) {
+      this.showError(error);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  private activeWorkspaceRoot(): WorkspaceRootSnapshot | null {
+    if (!this.project) return null;
+    return (
+      this.project.roots.find((root) => root.id === this.activeRootId) ??
+      this.project.roots[0] ??
+      null
+    );
+  }
+
+  private workspaceDisplayPath(path: string): string {
+    const parsed = splitWorkspaceFilePath(path);
+    if (!parsed) return path;
+    const root = this.project?.roots.find((candidate) => candidate.id === parsed.rootId);
+    return root ? `${root.name}/${parsed.relativePath}` : parsed.relativePath;
+  }
+
+  private setActiveWorkspaceRoot(rootId: string): void {
+    if (!this.project?.roots.some((root) => root.id === rootId)) return;
+    if (this.activeRootId === rootId) return;
+    this.activeRootId = rootId;
+    this.tree.querySelectorAll<HTMLElement>(".workspace-root").forEach((section) => {
+      section.classList.toggle("active", section.dataset.workspaceRoot === rootId);
+    });
+    this.terminal.syncWorkspaceFolders();
+    this.syncChrome();
+  }
+
+  private syncWorkspaceIdentity(): void {
+    const roots = this.project?.roots ?? [];
+    this.terminal.syncWorkspaceFolders();
+    if (roots.length === 0) {
+      this.projectName.textContent = "No folder open";
+      this.projectPath.textContent = "No project selected";
+      this.projectPath.title = "";
+      document.title = "NullPointer";
+      return;
+    }
+    if (roots.length === 1) {
+      const root = roots[0]!;
+      this.projectName.textContent = root.name;
+      this.projectPath.textContent = root.rootPath;
+      this.projectPath.title = root.rootPath;
+      document.title = `${root.name} — NullPointer`;
+      return;
+    }
+    this.projectName.textContent = `${roots.length} folders`;
+    this.projectPath.textContent = `Workspace · ${roots.length} folders`;
+    this.projectPath.title = roots.map((root) => root.rootPath).join("\n");
+    document.title = `${roots.length} folders — NullPointer`;
+  }
+
+  private async removeWorkspaceRoot(rootId: string): Promise<void> {
+    const root = this.project?.roots.find((candidate) => candidate.id === rootId);
+    if (!root) return;
+    const prefix = `${rootId}/`;
+    const openPaths = this.editor.paths.filter((path) => path.startsWith(prefix));
+    const dirtyCount = openPaths.filter((path) => this.dirty.has(path)).length;
+    if (
+      dirtyCount > 0 &&
+      !window.confirm(
+        `Remove ${root.name} from the workspace and discard ${dirtyCount} unsaved file${dirtyCount === 1 ? "" : "s"}?`,
+      )
+    ) {
+      return;
+    }
+
+    this.setBusy(true, `Removing ${root.name}…`);
+    try {
+      const snapshot = await removeWorkspaceFolder(rootId);
+      for (const path of openPaths) {
+        this.editor.close(path);
+        this.dirty.delete(path);
+        this.loadingFiles.delete(path);
+      }
+      this.projectGeneration += 1;
+      this.project = snapshot.roots.length > 0 ? snapshot : null;
+      this.expandedWorkspaceRoots.delete(rootId);
+      for (const path of [...this.expanded]) {
+        if (path.startsWith(prefix)) this.expanded.delete(path);
+      }
+      for (const repository of [...this.commitMessages.keys()]) {
+        if (repository.startsWith(prefix)) this.commitMessages.delete(repository);
+      }
+      for (const repository of [...this.collapsedRepositories]) {
+        if (repository.startsWith(prefix)) this.collapsedRepositories.delete(repository);
+      }
+      for (const group of [...this.collapsedGitGroups]) {
+        if (group.startsWith(prefix)) this.collapsedGitGroups.delete(group);
+      }
+      this.activeRootId =
+        this.activeRootId === rootId
+          ? (this.project?.roots[0]?.id ?? null)
+          : this.activeRootId;
+      this.gitWorkspace = null;
+      this.gitError = null;
+      this.graphRepository = null;
+      this.syncWorkspaceIdentity();
+      this.renderTree();
+      this.renderTabs();
+      this.renderGit();
+      this.syncChrome();
+      this.toast(`Removed ${root.name} from workspace`, "success", 2000);
+      if (this.project) void this.refreshGit(true);
     } catch (error) {
       this.showError(error);
     } finally {
@@ -515,7 +685,10 @@ class NullPointerApp {
     if (!selected) return;
     this.graphRepository = selected.relativePath;
     this.scmGraphRepositoryLabel.textContent = selected.name;
-    this.scmGraphRepositoryLabel.title = selected.relativePath;
+    this.scmGraphRepositoryLabel.title =
+      selected.pathWithinRoot === "."
+        ? selected.workspaceRootName
+        : `${selected.workspaceRootName}/${selected.pathWithinRoot}`;
     this.scmGraphRepositoryTrigger.setAttribute(
       "aria-label",
       `Graph repository: ${selected.name}`,
@@ -527,7 +700,10 @@ class NullPointerApp {
       option.className = "scm-graph-repository-option";
       option.classList.toggle("active", repository.relativePath === selected.relativePath);
       option.dataset.graphRepository = repository.relativePath;
-      option.title = repository.relativePath;
+      option.title =
+        repository.pathWithinRoot === "."
+          ? repository.workspaceRootName
+          : `${repository.workspaceRootName}/${repository.pathWithinRoot}`;
       option.setAttribute("role", "option");
       option.setAttribute(
         "aria-selected",
@@ -631,9 +807,7 @@ class NullPointerApp {
     const option = target.closest<HTMLButtonElement>("[data-graph-repository]");
     if (!option?.dataset.graphRepository) return;
     this.scmGraphRepositoryMenu.hidePopover();
-    if (this.graphRepository === option.dataset.graphRepository) return;
-    this.graphRepository = option.dataset.graphRepository;
-    this.renderGitGraph();
+    this.selectGraphRepositoryFromInteraction(option.dataset.graphRepository);
   }
 
   private handleGraphRepositoryKeydown(event: KeyboardEvent): void {
@@ -654,14 +828,12 @@ class NullPointerApp {
   }
 
   private selectGraphRepositoryFromInteraction(repositoryPath: string): void {
-    if (
-      this.graphRepository === repositoryPath ||
-      !this.gitWorkspace?.repositories.some(
-        (repository) => repository.relativePath === repositoryPath,
-      )
-    ) {
-      return;
-    }
+    const repository = this.gitWorkspace?.repositories.find(
+      (candidate) => candidate.relativePath === repositoryPath,
+    );
+    if (!repository) return;
+    this.setActiveWorkspaceRoot(repository.workspaceRootId);
+    if (this.graphRepository === repositoryPath) return;
     this.graphRepository = repositoryPath;
     this.renderGitGraph();
   }
@@ -930,7 +1102,10 @@ class NullPointerApp {
     header.className = "scm-repo-header";
     header.dataset.repositoryToggle = repository.relativePath;
     header.setAttribute("aria-expanded", String(!collapsed));
-    header.title = repository.relativePath === "." ? repository.name : repository.relativePath;
+    header.title =
+      repository.pathWithinRoot === "."
+        ? repository.workspaceRootName
+        : `${repository.workspaceRootName}/${repository.pathWithinRoot}`;
 
     const marker = document.createElement("span");
     marker.className = "scm-repo-marker";
@@ -1313,11 +1488,16 @@ class NullPointerApp {
 
     const open = target.closest<HTMLButtonElement>("[data-git-open]");
     if (open?.dataset.gitOpen && open.dataset.repository) {
-      const path =
-        open.dataset.repository === "."
+      const repository = this.gitWorkspace?.repositories.find(
+        (candidate) => candidate.relativePath === open.dataset.repository,
+      );
+      if (!repository) return;
+      const relativePath =
+        repository.pathWithinRoot === "."
           ? open.dataset.gitOpen
-          : `${open.dataset.repository}/${open.dataset.gitOpen}`;
-      await this.openFile(path);
+          : `${repository.pathWithinRoot}/${open.dataset.gitOpen}`;
+      this.setActiveWorkspaceRoot(repository.workspaceRootId);
+      await this.openFile(workspaceFilePath(repository.workspaceRootId, relativePath));
     }
   }
 
@@ -1438,10 +1618,12 @@ class NullPointerApp {
         row.type = "button";
         row.className = "tree-row";
         row.dataset.path = entry.path;
+        row.dataset.rootId = entry.rootId;
+        row.dataset.relativePath = entry.relativePath;
         row.dataset.kind = entry.kind;
         row.dataset.depth = String(depth);
         row.style.setProperty("--tree-depth", String(depth));
-        row.title = entry.path;
+        row.title = `${entry.rootName}/${entry.relativePath}`;
         if (entry.path === this.editor.active) row.classList.add("active");
         if (this.loadingFiles.has(entry.path)) row.classList.add("loading");
         if (entry.kind === "directory" && this.expanded.has(entry.path)) {
@@ -1474,7 +1656,55 @@ class NullPointerApp {
         }
       }
     };
-    appendEntries(this.project.entries, 0, fragment);
+
+    for (const root of this.project.roots) {
+      const rootSection = document.createElement("section");
+      rootSection.className = "workspace-root";
+      rootSection.dataset.workspaceRoot = root.id;
+      rootSection.classList.toggle("active", root.id === this.activeRootId);
+      const expanded = this.expandedWorkspaceRoots.has(root.id);
+      rootSection.classList.toggle("collapsed", !expanded);
+
+      const rootHeader = document.createElement("div");
+      rootHeader.className = "workspace-root-header";
+      const rootToggle = document.createElement("button");
+      rootToggle.type = "button";
+      rootToggle.className = "workspace-root-toggle";
+      rootToggle.dataset.workspaceRootToggle = root.id;
+      rootToggle.setAttribute("aria-expanded", String(expanded));
+      rootToggle.title = root.rootPath;
+      const marker = document.createElement("span");
+      marker.className = "workspace-root-marker";
+      marker.innerHTML = icon("chevron-down", 15);
+      const folder = document.createElement("span");
+      folder.className = "workspace-root-icon";
+      folder.innerHTML = icon(expanded ? "folder-open" : "folder", 17);
+      const text = document.createElement("span");
+      text.className = "workspace-root-text";
+      const name = document.createElement("strong");
+      name.textContent = root.name;
+      const path = document.createElement("small");
+      path.textContent = root.rootPath;
+      text.append(name, path);
+      rootToggle.append(marker, folder, text);
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "workspace-root-remove";
+      remove.dataset.removeWorkspaceRoot = root.id;
+      remove.title = `Remove ${root.name} from workspace`;
+      remove.setAttribute("aria-label", remove.title);
+      remove.innerHTML = icon("x", 14);
+      rootHeader.append(rootToggle, remove);
+
+      const body = document.createElement("div");
+      body.className = "workspace-root-body";
+      body.dataset.workspaceRootBody = root.id;
+      body.hidden = !expanded;
+      appendEntries(root.entries, 0, body);
+      rootSection.append(rootHeader, body);
+      fragment.append(rootSection);
+    }
     this.tree.append(fragment);
   }
 
@@ -1490,9 +1720,32 @@ class NullPointerApp {
   private handleTreeClick(event: MouseEvent): void {
     const target = event.target;
     if (!(target instanceof Element)) return;
+    const removeRoot = target.closest<HTMLButtonElement>("[data-remove-workspace-root]");
+    if (removeRoot?.dataset.removeWorkspaceRoot) {
+      void this.removeWorkspaceRoot(removeRoot.dataset.removeWorkspaceRoot);
+      return;
+    }
+    const rootToggle = target.closest<HTMLButtonElement>("[data-workspace-root-toggle]");
+    if (rootToggle?.dataset.workspaceRootToggle) {
+      const rootId = rootToggle.dataset.workspaceRootToggle;
+      this.setActiveWorkspaceRoot(rootId);
+      const section = rootToggle.closest<HTMLElement>(".workspace-root");
+      const body = section?.querySelector<HTMLElement>(".workspace-root-body");
+      if (!section || !body) return;
+      const expanding = !this.expandedWorkspaceRoots.has(rootId);
+      if (expanding) this.expandedWorkspaceRoots.add(rootId);
+      else this.expandedWorkspaceRoots.delete(rootId);
+      section.classList.toggle("collapsed", !expanding);
+      rootToggle.setAttribute("aria-expanded", String(expanding));
+      const folder = rootToggle.querySelector<HTMLElement>(".workspace-root-icon");
+      if (folder) folder.innerHTML = icon(expanding ? "folder-open" : "folder", 17);
+      this.animateDisclosure(body, expanding);
+      return;
+    }
     const row = target.closest<HTMLButtonElement>(".tree-row");
     const path = row?.dataset.path;
     if (!row || !path) return;
+    if (row.dataset.rootId) this.setActiveWorkspaceRoot(row.dataset.rootId);
 
     if (row.dataset.kind === "directory") {
       this.toggleDirectory(row, path);
@@ -1582,6 +1835,8 @@ class NullPointerApp {
   }
 
   private async openFile(path: string): Promise<void> {
+    const workspacePath = splitWorkspaceFilePath(path);
+    if (workspacePath) this.setActiveWorkspaceRoot(workspacePath.rootId);
     this.showEditorWorkspace();
     if (this.editor.has(path)) {
       this.editor.activate(path);
@@ -1620,7 +1875,7 @@ class NullPointerApp {
       tab.type = "button";
       tab.className = "tab";
       tab.dataset.path = path;
-      tab.title = path;
+      tab.title = this.workspaceDisplayPath(path);
       if (path === this.editor.active) tab.classList.add("active");
 
       const fileGlyph = document.createElement("span");
@@ -1652,6 +1907,8 @@ class NullPointerApp {
     const tab = target.closest<HTMLButtonElement>(".tab");
     const path = tab?.dataset.path;
     if (path && this.editor.activate(path)) {
+      const workspacePath = splitWorkspaceFilePath(path);
+      if (workspacePath) this.setActiveWorkspaceRoot(workspacePath.rootId);
       this.renderTabs();
       this.renderTree();
       this.syncChrome();
@@ -1682,7 +1939,11 @@ class NullPointerApp {
     if (wasActive) {
       const remaining = [...this.editor.paths];
       const next = remaining[Math.min(Math.max(index, 0), remaining.length - 1)];
-      if (next) this.editor.activate(next);
+      if (next) {
+        this.editor.activate(next);
+        const workspacePath = splitWorkspaceFilePath(next);
+        if (workspacePath) this.setActiveWorkspaceRoot(workspacePath.rootId);
+      }
     }
     this.renderTabs();
     this.renderTree();
@@ -1780,8 +2041,9 @@ class NullPointerApp {
       const name = document.createElement("strong");
       name.textContent = entry.name;
       const parent = document.createElement("small");
-      const slash = entry.path.lastIndexOf("/");
-      parent.textContent = slash > -1 ? entry.path.slice(0, slash) : this.project?.name ?? "";
+      const slash = entry.relativePath.lastIndexOf("/");
+      const directory = slash > -1 ? entry.relativePath.slice(0, slash) : "";
+      parent.textContent = directory ? `${entry.rootName} · ${directory}` : entry.rootName;
       text.append(name, parent);
       row.append(glyph, text);
       fragment.append(row);
@@ -1819,7 +2081,8 @@ class NullPointerApp {
   }
 
   private showEntryDialog(): void {
-    if (!this.project) return;
+    const root = this.activeWorkspaceRoot();
+    if (!root) return;
     if (this.entryDialog.open) {
       this.entryInput.focus();
       return;
@@ -1829,6 +2092,7 @@ class NullPointerApp {
     this.createKind = "file";
     this.syncEntryKindButtons();
     this.entryDialog.classList.remove("closing");
+    this.entryInput.setAttribute("aria-description", `Create inside ${root.name}`);
     this.entryDialog.showModal();
     requestAnimationFrame(() => this.entryInput.focus());
   }
@@ -1851,22 +2115,29 @@ class NullPointerApp {
     }
 
     const submit = element<HTMLButtonElement>("#entry-submit");
+    const root = this.activeWorkspaceRoot();
+    if (!root) {
+      this.entryError.textContent = "Select a workspace folder first.";
+      return;
+    }
     submit.disabled = true;
     try {
-      this.project = await createProjectEntry(path, this.createKind);
+      this.project = await createProjectEntry(root.id, path, this.createKind);
       const parentEnd = path.lastIndexOf("/");
       if (parentEnd > 0) {
         const parts = path.slice(0, parentEnd).split("/");
         let current = "";
         for (const part of parts) {
           current = current ? `${current}/${part}` : part;
-          this.expanded.add(current);
+          this.expanded.add(workspaceFilePath(root.id, current));
         }
       }
       this.closeDialogAnimated(this.entryDialog);
       this.renderTree();
       this.toast(`${this.createKind === "file" ? "Created" : "Created folder"} ${path}`, "success");
-      if (this.createKind === "file") await this.openFile(path);
+      if (this.createKind === "file") {
+        await this.openFile(workspaceFilePath(root.id, path));
+      }
     } catch (error) {
       this.entryError.textContent = toAppError(error).message;
     } finally {
@@ -2015,9 +2286,9 @@ class NullPointerApp {
     this.generalStatus.textContent = researchActive
       ? "Research workspace"
       : active
-        ? active
+        ? this.workspaceDisplayPath(active)
         : hasProject
-          ? this.project?.rootPath ?? ""
+          ? this.activeWorkspaceRoot()?.rootPath ?? ""
           : "Ready";
   }
 
@@ -2182,6 +2453,9 @@ element<HTMLElement>("#app").innerHTML = `
       <div class="sidebar-header">
         <span id="sidebar-title">Explorer</span>
         <div class="sidebar-actions" id="explorer-actions">
+          <button class="mini-button" id="add-workspace-folder-button" type="button" title="Add folder to workspace" aria-label="Add folder to workspace">
+            ${icon("folder-plus", 18)}
+          </button>
           <button class="mini-button" id="new-entry-button" type="button" title="New file or folder" aria-label="New file or folder">
             ${icon("file-plus", 18)}
           </button>
@@ -2384,6 +2658,23 @@ element<HTMLElement>("#app").innerHTML = `
             ${icon("search", 14)}
             <input id="terminal-search-input" type="text" autocomplete="off" spellcheck="false" placeholder="Find" aria-label="Find in terminal" />
             <span>Enter</span>
+          </div>
+          <div class="terminal-shell-picker terminal-cwd-picker hidden" id="terminal-cwd-picker">
+            <button
+              class="terminal-shell-trigger"
+              id="terminal-cwd-trigger"
+              type="button"
+              data-terminal-action="cwd-menu"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="terminal-cwd-menu"
+              title="Working folder for new terminals"
+            >
+              ${icon("folder", 13)}
+              <span id="terminal-cwd-label">Workspace folder</span>
+              ${icon("chevron-down", 13)}
+            </button>
+            <div class="terminal-shell-menu terminal-cwd-menu" id="terminal-cwd-menu" role="listbox" aria-label="Working folder for new terminals" aria-hidden="true"></div>
           </div>
           <div class="terminal-shell-picker" id="terminal-shell-picker">
             <button

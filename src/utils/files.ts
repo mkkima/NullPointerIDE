@@ -33,6 +33,21 @@ export function languageName(path: string): string {
   return LANGUAGE_NAMES[extension(path)] ?? "Plain Text";
 }
 
+export function workspaceFilePath(rootId: string, relativePath: string): string {
+  return `${rootId}/${relativePath}`;
+}
+
+export function splitWorkspaceFilePath(
+  path: string,
+): { readonly rootId: string; readonly relativePath: string } | null {
+  const separator = path.indexOf("/");
+  if (separator <= 0 || separator === path.length - 1) return null;
+  const rootId = path.slice(0, separator);
+  const relativePath = path.slice(separator + 1);
+  if (!/^root-\d+$/.test(rootId) || !relativePath) return null;
+  return { rootId, relativePath };
+}
+
 export function flattenFiles(entries: readonly FileEntry[]): FileEntry[] {
   const files: FileEntry[] = [];
   const visit = (nodes: readonly FileEntry[]): void => {
@@ -76,7 +91,10 @@ export function findQuickOpenMatches(
   limit = 80,
 ): FileEntry[] {
   return flattenFiles(entries)
-    .map((entry) => ({ entry, score: fuzzyScore(entry.path, query) }))
+    .map((entry) => ({
+      entry,
+      score: fuzzyScore(`${entry.rootName}/${entry.relativePath}`, query),
+    }))
     .filter((item): item is { entry: FileEntry; score: number } => item.score !== null)
     .sort((left, right) => right.score - left.score || left.entry.path.localeCompare(right.entry.path))
     .slice(0, limit)

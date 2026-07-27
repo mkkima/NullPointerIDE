@@ -3,9 +3,20 @@ export type EntryKind = "file" | "directory";
 export interface FileEntry {
   readonly name: string;
   readonly path: string;
+  readonly relativePath: string;
+  readonly rootId: string;
+  readonly rootName: string;
   readonly kind: EntryKind;
   readonly isSymlink: boolean;
   readonly children: readonly FileEntry[];
+}
+
+export interface WorkspaceRootSnapshot {
+  readonly id: string;
+  readonly rootPath: string;
+  readonly name: string;
+  readonly entries: readonly FileEntry[];
+  readonly truncated: boolean;
 }
 
 export interface ProjectSnapshot {
@@ -13,6 +24,7 @@ export interface ProjectSnapshot {
   readonly name: string;
   readonly entries: readonly FileEntry[];
   readonly truncated: boolean;
+  readonly roots: readonly WorkspaceRootSnapshot[];
 }
 
 export interface FileDocument {
@@ -102,6 +114,9 @@ export interface GitCommitResult {
 
 export interface GitRepository {
   readonly relativePath: string;
+  readonly workspaceRootId: string;
+  readonly workspaceRootName: string;
+  readonly pathWithinRoot: string;
   readonly name: string;
   readonly branch: string;
   readonly detached: boolean;

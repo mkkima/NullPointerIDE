@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
         RwLock,
     },
     time::{Duration, UNIX_EPOCH},
@@ -20,6 +20,7 @@ use tauri_plugin_updater::UpdaterExt;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 20_000;
 const MAX_TREE_DEPTH: usize = 32;
+const MAX_WORKSPACE_ROOTS: usize = 8;
 const MIN_RESEARCH_DRAFTS: usize = 2;
 const MAX_RESEARCH_DRAFTS: usize = 4;
 const MAX_RESEARCH_TEXT_BYTES: usize = 8 * 1024 * 1024;
@@ -53,7 +54,14 @@ struct GitCommitResult {
 
 #[derive(Default)]
 struct AppState {
-    project_root: RwLock<Option<PathBuf>>,
+    workspace_roots: RwLock<Vec<WorkspaceRoot>>,
+    next_workspace_root_id: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceRoot {
+    id: String,
+    path: PathBuf,
 }
 
 #[derive(Default)]
@@ -125,10 +133,17 @@ impl CommandError {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectSnapshot {
+    id: String,
     root_path: String,
     name: String,
     entries: Vec<FileEntry>,
     truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSnapshot {
+    roots: Vec<ProjectSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -294,23 +309,68 @@ impl TreeContext {
 }
 
 #[tauri::command]
-fn open_project(path: String, state: State<'_, AppState>) -> CommandResult<ProjectSnapshot> {
-    let root = fs::canonicalize(Path::new(&path))
-        .map_err(|error| CommandError::io("Could not open the selected folder", error))?;
+fn open_project(path: String, state: State<'_, AppState>) -> CommandResult<WorkspaceSnapshot> {
+    let root = canonicalize_workspace_root(&path)?;
+    let id = next_workspace_root_id(&state);
+    let workspace_root = WorkspaceRoot { id, path: root };
+    let mut workspace_roots = state
+        .workspace_roots
+        .write()
+        .map_err(|_| CommandError::new("state_error", "Workspace state is unavailable."))?;
+    let snapshot = build_workspace_snapshot(std::slice::from_ref(&workspace_root))?;
+    *workspace_roots = vec![workspace_root];
+    Ok(snapshot)
+}
 
-    if !root.is_dir() {
+#[tauri::command]
+fn add_workspace_folder(
+    path: String,
+    state: State<'_, AppState>,
+) -> CommandResult<WorkspaceSnapshot> {
+    let root = canonicalize_workspace_root(&path)?;
+    let mut stored = state
+        .workspace_roots
+        .write()
+        .map_err(|_| CommandError::new("state_error", "Workspace state is unavailable."))?;
+    let mut roots = stored.clone();
+    if roots.iter().any(|candidate| candidate.path == root) {
+        return build_workspace_snapshot(&roots);
+    }
+    if roots.len() >= MAX_WORKSPACE_ROOTS {
         return Err(CommandError::new(
-            "not_a_directory",
-            "The selected path is not a directory.",
+            "workspace_root_limit",
+            format!("A workspace can contain at most {MAX_WORKSPACE_ROOTS} folders."),
         ));
     }
+    roots.push(WorkspaceRoot {
+        id: next_workspace_root_id(&state),
+        path: root,
+    });
+    let snapshot = build_workspace_snapshot(&roots)?;
+    *stored = roots;
+    Ok(snapshot)
+}
 
-    let snapshot = build_project_snapshot(&root)?;
-    let mut project_root = state
-        .project_root
+#[tauri::command]
+fn remove_workspace_folder(
+    root_id: String,
+    state: State<'_, AppState>,
+) -> CommandResult<WorkspaceSnapshot> {
+    let mut stored = state
+        .workspace_roots
         .write()
-        .map_err(|_| CommandError::new("state_error", "Project state is unavailable."))?;
-    *project_root = Some(root);
+        .map_err(|_| CommandError::new("state_error", "Workspace state is unavailable."))?;
+    let mut roots = stored.clone();
+    let original_length = roots.len();
+    roots.retain(|root| root.id != root_id);
+    if roots.len() == original_length {
+        return Err(CommandError::new(
+            "workspace_root_not_found",
+            "The workspace folder no longer exists.",
+        ));
+    }
+    let snapshot = build_workspace_snapshot(&roots)?;
+    *stored = roots;
     Ok(snapshot)
 }
 
@@ -505,17 +565,17 @@ async fn install_app_version(
 }
 
 #[tauri::command]
-fn refresh_project(state: State<'_, AppState>) -> CommandResult<ProjectSnapshot> {
-    let root = current_root(&state)?;
-    build_project_snapshot(&root)
+fn refresh_project(state: State<'_, AppState>) -> CommandResult<WorkspaceSnapshot> {
+    build_workspace_snapshot(&workspace_roots(&state)?)
 }
 
 #[tauri::command]
 fn read_project_file(
+    root_id: String,
     relative_path: String,
     state: State<'_, AppState>,
 ) -> CommandResult<FileDocument> {
-    let root = current_root(&state)?;
+    let root = workspace_root_by_id(&state, &root_id)?.path;
     let normalized = normalize_relative(&relative_path)?;
     let path = resolve_existing_file(&root, &normalized)?;
     let metadata = fs::metadata(&path)
@@ -568,6 +628,7 @@ fn read_project_file(
 
 #[tauri::command]
 fn write_project_file(
+    root_id: String,
     relative_path: String,
     content: String,
     expected_modified_at_ms: Option<u64>,
@@ -583,7 +644,7 @@ fn write_project_file(
         ));
     }
 
-    let root = current_root(&state)?;
+    let root = workspace_root_by_id(&state, &root_id)?.path;
     let normalized = normalize_relative(&relative_path)?;
     let path = resolve_existing_file(&root, &normalized)?;
     let metadata = fs::metadata(&path)
@@ -629,11 +690,12 @@ fn write_project_file(
 
 #[tauri::command]
 fn create_project_entry(
+    root_id: String,
     relative_path: String,
     kind: CreateKind,
     state: State<'_, AppState>,
-) -> CommandResult<ProjectSnapshot> {
-    let root = current_root(&state)?;
+) -> CommandResult<WorkspaceSnapshot> {
+    let root = workspace_root_by_id(&state, &root_id)?.path;
     let normalized = normalize_relative(&relative_path)?;
     let parent_relative = normalized.parent().unwrap_or_else(|| Path::new(""));
     let parent = fs::canonicalize(root.join(parent_relative))
@@ -669,7 +731,7 @@ fn create_project_entry(
         }
     }
 
-    build_project_snapshot(&root)
+    build_workspace_snapshot(&workspace_roots(&state)?)
 }
 
 #[tauri::command]
@@ -813,8 +875,8 @@ async fn save_research_files(
 
 #[tauri::command]
 async fn get_git_workspace(state: State<'_, AppState>) -> CommandResult<git::GitWorkspace> {
-    let root = current_root(&state)?;
-    run_git_task(move || git::workspace(&root)).await
+    let roots = workspace_roots(&state)?;
+    run_git_task(move || git_workspace_for_roots(&roots)).await
 }
 
 #[tauri::command]
@@ -823,10 +885,11 @@ async fn git_stage_file(
     path: String,
     state: State<'_, AppState>,
 ) -> CommandResult<git::GitWorkspace> {
-    let root = current_root(&state)?;
+    let roots = workspace_roots(&state)?;
     run_git_task(move || {
-        git::stage_file(&root, &repository, &path)?;
-        git::workspace(&root)
+        let (root, repository) = git_repository_target(&roots, &repository)?;
+        git::stage_file(&root.path, &repository, &path)?;
+        git_workspace_for_roots(&roots)
     })
     .await
 }
@@ -837,10 +900,11 @@ async fn git_unstage_file(
     path: String,
     state: State<'_, AppState>,
 ) -> CommandResult<git::GitWorkspace> {
-    let root = current_root(&state)?;
+    let roots = workspace_roots(&state)?;
     run_git_task(move || {
-        git::unstage_file(&root, &repository, &path)?;
-        git::workspace(&root)
+        let (root, repository) = git_repository_target(&roots, &repository)?;
+        git::unstage_file(&root.path, &repository, &path)?;
+        git_workspace_for_roots(&roots)
     })
     .await
 }
@@ -850,10 +914,11 @@ async fn git_stage_all(
     repository: String,
     state: State<'_, AppState>,
 ) -> CommandResult<git::GitWorkspace> {
-    let root = current_root(&state)?;
+    let roots = workspace_roots(&state)?;
     run_git_task(move || {
-        git::stage_all(&root, &repository)?;
-        git::workspace(&root)
+        let (root, repository) = git_repository_target(&roots, &repository)?;
+        git::stage_all(&root.path, &repository)?;
+        git_workspace_for_roots(&roots)
     })
     .await
 }
@@ -865,36 +930,92 @@ async fn git_commit_repository(
     action: GitCommitAction,
     state: State<'_, AppState>,
 ) -> CommandResult<GitCommitResult> {
-    let root = current_root(&state)?;
+    let roots = workspace_roots(&state)?;
     run_git_task(move || {
+        let (root, repository_path) = git_repository_target(&roots, &repository)?;
         let warning = match action {
             GitCommitAction::Commit => {
-                git::commit(&root, &repository, &message)?;
+                git::commit(&root.path, &repository_path, &message)?;
                 None
             }
             GitCommitAction::CommitAmend => {
-                git::amend(&root, &repository, &message)?;
+                git::amend(&root.path, &repository_path, &message)?;
                 None
             }
             GitCommitAction::CommitPush => {
-                git::commit(&root, &repository, &message)?;
-                git::push(&root, &repository)
+                git::commit(&root.path, &repository_path, &message)?;
+                git::push(&root.path, &repository_path)
                     .err()
                     .map(|error| format!("Commit created, but push failed: {error}"))
             }
             GitCommitAction::CommitSync => {
-                git::commit(&root, &repository, &message)?;
-                git::sync(&root, &repository)
+                git::commit(&root.path, &repository_path, &message)?;
+                git::sync(&root.path, &repository_path)
                     .err()
                     .map(|error| format!("Commit created, but sync failed: {error}"))
             }
         };
         Ok(GitCommitResult {
-            workspace: git::workspace(&root)?,
+            workspace: git_workspace_for_roots(&roots)?,
             warning,
         })
     })
     .await
+}
+
+fn git_workspace_for_roots(roots: &[WorkspaceRoot]) -> Result<git::GitWorkspace, String> {
+    let mut repositories = Vec::new();
+    let mut total_changes = 0_usize;
+    let multiple_roots = roots.len() > 1;
+
+    for root in roots {
+        let workspace = git::workspace(&root.path)?;
+        total_changes = total_changes.saturating_add(workspace.total_changes);
+        for mut repository in workspace.repositories {
+            let path_within_root = repository.relative_path.clone();
+            repository.workspace_root_id = root.id.clone();
+            repository.workspace_root_name = workspace_root_name(&root.path);
+            repository.path_within_root = path_within_root.clone();
+            repository.relative_path = format!("{}/{}", root.id, path_within_root);
+            if multiple_roots {
+                repository.name =
+                    format!("{} · {}", repository.workspace_root_name, repository.name);
+            }
+            repositories.push(repository);
+        }
+    }
+
+    repositories.sort_by(|left, right| {
+        left.workspace_root_name
+            .to_lowercase()
+            .cmp(&right.workspace_root_name.to_lowercase())
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(git::GitWorkspace {
+        repositories,
+        total_changes,
+    })
+}
+
+fn git_repository_target(
+    roots: &[WorkspaceRoot],
+    repository_key: &str,
+) -> Result<(WorkspaceRoot, String), String> {
+    let (root_id, repository) = repository_key
+        .split_once('/')
+        .ok_or_else(|| "The selected repository identifier is invalid.".to_owned())?;
+    let root = roots
+        .iter()
+        .find(|root| root.id == root_id)
+        .cloned()
+        .ok_or_else(|| "The workspace folder for this repository is unavailable.".to_owned())?;
+    Ok((root, repository.to_owned()))
+}
+
+fn workspace_root_name(path: &Path) -> String {
+    path.file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 async fn run_io_task<T, F>(task: F) -> CommandResult<T>
@@ -1191,16 +1312,58 @@ fn create_research_file(
     ))
 }
 
-fn current_root(state: &State<'_, AppState>) -> CommandResult<PathBuf> {
+fn workspace_roots(state: &State<'_, AppState>) -> CommandResult<Vec<WorkspaceRoot>> {
     state
-        .project_root
+        .workspace_roots
         .read()
-        .map_err(|_| CommandError::new("state_error", "Project state is unavailable."))?
-        .clone()
-        .ok_or_else(|| CommandError::new("no_project", "Open a project folder first."))
+        .map_err(|_| CommandError::new("state_error", "Workspace state is unavailable."))
+        .map(|roots| roots.clone())
 }
 
-fn build_project_snapshot(root: &Path) -> CommandResult<ProjectSnapshot> {
+fn workspace_root_by_id(
+    state: &State<'_, AppState>,
+    root_id: &str,
+) -> CommandResult<WorkspaceRoot> {
+    workspace_roots(state)?
+        .into_iter()
+        .find(|root| root.id == root_id)
+        .ok_or_else(|| {
+            CommandError::new(
+                "workspace_root_not_found",
+                "The workspace folder is no longer available.",
+            )
+        })
+}
+
+fn canonicalize_workspace_root(path: &str) -> CommandResult<PathBuf> {
+    let root = fs::canonicalize(Path::new(path))
+        .map_err(|error| CommandError::io("Could not open the selected folder", error))?;
+    if !root.is_dir() {
+        return Err(CommandError::new(
+            "not_a_directory",
+            "The selected path is not a directory.",
+        ));
+    }
+    Ok(root)
+}
+
+fn next_workspace_root_id(state: &State<'_, AppState>) -> String {
+    let sequence = state
+        .next_workspace_root_id
+        .fetch_add(1, AtomicOrdering::Relaxed)
+        .saturating_add(1);
+    format!("root-{sequence}")
+}
+
+fn build_workspace_snapshot(roots: &[WorkspaceRoot]) -> CommandResult<WorkspaceSnapshot> {
+    let mut snapshots = Vec::with_capacity(roots.len());
+    for root in roots {
+        snapshots.push(build_project_snapshot(&root.id, &root.path)?);
+    }
+    Ok(WorkspaceSnapshot { roots: snapshots })
+}
+
+fn build_project_snapshot(id: &str, root: &Path) -> CommandResult<ProjectSnapshot> {
     let mut context = TreeContext::new();
     let entries = walk_directory(root, root, 0, &mut context)?;
     let name = root
@@ -1209,6 +1372,7 @@ fn build_project_snapshot(root: &Path) -> CommandResult<ProjectSnapshot> {
         .unwrap_or_else(|| root.to_string_lossy().into_owned());
 
     Ok(ProjectSnapshot {
+        id: id.to_owned(),
         root_path: path_to_display_string(root),
         name,
         entries,
@@ -1457,6 +1621,8 @@ pub fn run() {
             list_app_releases,
             install_app_version,
             open_project,
+            add_workspace_folder,
+            remove_workspace_folder,
             refresh_project,
             read_project_file,
             write_project_file,
@@ -1540,6 +1706,52 @@ mod tests {
     fn converts_paths_to_slash_separated_strings() {
         let path = PathBuf::from("src").join("editor").join("mod.rs");
         assert_eq!(path_to_relative_string(&path), "src/editor/mod.rs");
+    }
+
+    #[test]
+    fn routes_git_repository_keys_to_their_workspace_folder() {
+        let roots = vec![
+            WorkspaceRoot {
+                id: "root-1".to_owned(),
+                path: PathBuf::from("first"),
+            },
+            WorkspaceRoot {
+                id: "root-2".to_owned(),
+                path: PathBuf::from("second"),
+            },
+        ];
+
+        let (root, repository) =
+            git_repository_target(&roots, "root-2/packages/app").expect("key should be valid");
+        assert_eq!(root.id, "root-2");
+        assert_eq!(repository, "packages/app");
+        assert!(git_repository_target(&roots, "root-3/packages/app").is_err());
+        assert!(git_repository_target(&roots, "packages/app").is_err());
+    }
+
+    #[test]
+    fn preserves_workspace_root_identity_in_snapshots() {
+        let first = tempfile::tempdir().expect("temporary directory should be created");
+        let second = tempfile::tempdir().expect("temporary directory should be created");
+        fs::write(first.path().join("first.txt"), "first").expect("fixture should be written");
+        fs::write(second.path().join("second.txt"), "second").expect("fixture should be written");
+        let roots = vec![
+            WorkspaceRoot {
+                id: "root-7".to_owned(),
+                path: fs::canonicalize(first.path()).expect("path should be canonical"),
+            },
+            WorkspaceRoot {
+                id: "root-8".to_owned(),
+                path: fs::canonicalize(second.path()).expect("path should be canonical"),
+            },
+        ];
+
+        let snapshot = build_workspace_snapshot(&roots).expect("snapshot should be created");
+        assert_eq!(snapshot.roots.len(), 2);
+        assert_eq!(snapshot.roots[0].id, "root-7");
+        assert_eq!(snapshot.roots[0].entries[0].path, "first.txt");
+        assert_eq!(snapshot.roots[1].id, "root-8");
+        assert_eq!(snapshot.roots[1].entries[0].path, "second.txt");
     }
 
     #[test]

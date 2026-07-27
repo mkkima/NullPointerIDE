@@ -23,6 +23,9 @@ pub(crate) struct GitWorkspace {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GitRepository {
     pub(crate) relative_path: String,
+    pub(crate) workspace_root_id: String,
+    pub(crate) workspace_root_name: String,
+    pub(crate) path_within_root: String,
     pub(crate) name: String,
     pub(crate) branch: String,
     pub(crate) detached: bool,
@@ -279,7 +282,10 @@ fn repository_snapshot(workspace_root: &Path, repository: &Path) -> Result<GitRe
         .unwrap_or_else(|| repository.to_string_lossy().into_owned());
 
     Ok(GitRepository {
+        path_within_root: relative_path.clone(),
         relative_path,
+        workspace_root_id: String::new(),
+        workspace_root_name: String::new(),
         name,
         branch,
         detached,
