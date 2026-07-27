@@ -32,7 +32,12 @@ export interface FileDocument {
   readonly content: string;
   readonly modifiedAtMs: number;
   readonly size: number;
+  readonly readOnly: boolean;
+  readonly truncated: boolean;
+  readonly viewMode: FileViewMode;
 }
+
+export type FileViewMode = "text" | "utf16" | "hex";
 
 export interface SaveResult {
   readonly modifiedAtMs: number;

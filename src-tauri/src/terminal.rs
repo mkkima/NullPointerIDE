@@ -464,11 +464,11 @@ fn display_path(path: &Path) -> String {
     let display = path.to_string_lossy();
     #[cfg(windows)]
     {
-        return display
+        display
             .strip_prefix(r"\\?\UNC\")
             .map(|value| format!(r"\\{value}"))
             .or_else(|| display.strip_prefix(r"\\?\").map(str::to_owned))
-            .unwrap_or_else(|| display.into_owned());
+            .unwrap_or_else(|| display.into_owned())
     }
     #[cfg(not(windows))]
     {

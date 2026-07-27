@@ -60,6 +60,18 @@ interface NativeWorkspaceSnapshot {
   readonly roots: readonly NativeWorkspaceRoot[];
 }
 
+interface NativeStandaloneFileDocument {
+  readonly fileId: string;
+  readonly displayPath: string;
+  readonly document: FileDocument;
+}
+
+export interface StandaloneFileDocument {
+  readonly fileId: string;
+  readonly displayPath: string;
+  readonly document: FileDocument;
+}
+
 function hydrateWorkspace(snapshot: NativeWorkspaceSnapshot): ProjectSnapshot {
   const hydrateEntry = (
     root: NativeWorkspaceRoot,
@@ -123,6 +135,16 @@ export async function chooseProjectFolder(
   return typeof selection === "string" ? selection : null;
 }
 
+export async function chooseStandaloneFile(): Promise<string | null> {
+  requireDesktopRuntime();
+  const selection = await open({
+    directory: false,
+    multiple: false,
+    title: "Open file as text",
+  });
+  return typeof selection === "string" ? selection : null;
+}
+
 export async function isProductionBuild(): Promise<boolean> {
   if (!isTauri()) return false;
   return invoke<boolean>("is_production_build");
@@ -136,6 +158,11 @@ export async function isPortableBuild(): Promise<boolean> {
 export async function listAppReleases(): Promise<readonly AppRelease[]> {
   requireDesktopRuntime();
   return invoke<readonly AppRelease[]>("list_app_releases");
+}
+
+export async function checkPortableUpdate(): Promise<string | null> {
+  requireDesktopRuntime();
+  return invoke<string | null>("check_portable_update");
 }
 
 export async function installAppVersion(
@@ -190,6 +217,55 @@ export async function readProjectFile(path: string): Promise<FileDocument> {
     relativePath,
   });
   return { ...document, path };
+}
+
+function hydrateStandaloneFile(
+  result: NativeStandaloneFileDocument,
+): StandaloneFileDocument {
+  return {
+    fileId: result.fileId,
+    displayPath: result.displayPath,
+    document: {
+      ...result.document,
+      path: `${result.fileId}/${result.document.path}`,
+    },
+  };
+}
+
+export async function openStandaloneFile(
+  path: string,
+): Promise<StandaloneFileDocument> {
+  requireDesktopRuntime();
+  return hydrateStandaloneFile(
+    await invoke<NativeStandaloneFileDocument>("open_standalone_file", { path }),
+  );
+}
+
+export async function readStandaloneFile(
+  fileId: string,
+): Promise<StandaloneFileDocument> {
+  requireDesktopRuntime();
+  return hydrateStandaloneFile(
+    await invoke<NativeStandaloneFileDocument>("read_standalone_file", { fileId }),
+  );
+}
+
+export async function writeStandaloneFile(
+  fileId: string,
+  content: string,
+  expectedModifiedAtMs: number,
+): Promise<SaveResult> {
+  requireDesktopRuntime();
+  return invoke<SaveResult>("write_standalone_file", {
+    fileId,
+    content,
+    expectedModifiedAtMs,
+  });
+}
+
+export async function closeStandaloneFile(fileId: string): Promise<void> {
+  if (!isTauri()) return;
+  return invoke<void>("close_standalone_file", { fileId });
 }
 
 export async function writeProjectFile(

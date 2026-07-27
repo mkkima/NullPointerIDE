@@ -38,16 +38,17 @@ npm run tauri build
 
 Every successful push to `main` runs frontend and Rust tests, generates an internal
 version from the GitHub Actions run number, and publishes Windows x64 and macOS
-Apple Silicon installers in one GitHub Release. The shared `latest.json` contains
-signed updater bundles for both platforms. Installed production builds check for
-updates on startup and every 30 minutes. The **Updates** section can disable
-automatic checks, refresh the GitHub release history, show release notes, install
-a newer version, or roll back to an older signed build. Rolling back disables
-automatic updates so the selected version is not immediately replaced.
+Apple Silicon builds in one GitHub Release. `latest.json` contains signed updater
+bundles for installed builds, while `portable-latest.json` points to the signed
+Windows portable executable. Production builds check for updates on startup and
+every 30 minutes. The **Updates** section can disable automatic checks, refresh
+the GitHub release history, show release notes, install a newer version, or roll
+back to an older signed build. Rolling back disables automatic updates so the
+selected version is not immediately replaced.
 
-Only releases that contain a compatible `latest.json` can be installed. Both
-updates and rollbacks are downloaded and verified by Tauri against the embedded
-public key before the installer starts.
+Only releases that contain the compatible update manifest can be installed.
+Updates and rollbacks are downloaded and verified by Tauri against the embedded
+public key before any installer or portable replacement starts.
 
 The updater public key is committed in `src-tauri/tauri.conf.json`. The private key
 must never be committed; its local recovery copy is stored at
@@ -62,10 +63,13 @@ Each GitHub Release also contains
 `portable.flag` next to the executable to store WebView2 data, preferences,
 cache, and Research state in the adjacent `data` folder.
 
-Portable builds show the release history but do not run the NSIS self-updater:
-replacing a running portable folder with an installer would stop being portable.
-To update, close NullPointer, extract the newest portable ZIP, replace the
-application files, and preserve the existing `data` folder.
+Portable builds use a dedicated signed update feed instead of the NSIS
+installer. NullPointer downloads and verifies the new portable executable,
+starts a temporary helper, replaces the executable only after the application
+has closed, preserves `data/`, and restarts. If the new executable does not
+confirm a healthy startup, the helper restores and relaunches the previous
+version automatically. Manual ZIP replacement remains available as a fallback;
+preserve the existing `data/` directory when doing so.
 
 ### macOS Apple Silicon
 

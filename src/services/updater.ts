@@ -1,6 +1,11 @@
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
-import { isProductionBuild } from "./native";
+import {
+  checkPortableUpdate,
+  installAppVersion,
+  isPortableBuild,
+  isProductionBuild,
+} from "./native";
 
 export type UpdateOutcome =
   | { readonly status: "not-available" }
@@ -16,7 +21,35 @@ interface UpdateCallbacks {
 export async function checkAndInstallUpdate(
   callbacks: UpdateCallbacks,
 ): Promise<UpdateOutcome> {
-  if (!(await isProductionBuild())) return { status: "not-available" };
+  const [production, portable] = await Promise.all([
+    isProductionBuild(),
+    isPortableBuild(),
+  ]);
+  if (!production) return { status: "not-available" };
+
+  if (portable) {
+    const version = await checkPortableUpdate();
+    if (!version) return { status: "not-available" };
+    if (!callbacks.canInstall()) {
+      return { status: "deferred", version };
+    }
+
+    callbacks.onAvailable(version);
+    let downloaded = 0;
+    let total: number | null = null;
+    await installAppVersion(version, (event) => {
+      if (event.event === "started") {
+        total = event.data.content_length;
+        callbacks.onProgress(0, total);
+      } else if (event.event === "progress") {
+        downloaded += event.data.chunk_length;
+        callbacks.onProgress(downloaded, total);
+      } else {
+        callbacks.onProgress(total ?? downloaded, total);
+      }
+    });
+    return { status: "installed", version };
+  }
 
   const update = await check();
   if (!update) return { status: "not-available" };

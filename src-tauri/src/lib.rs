@@ -1,10 +1,13 @@
 mod git;
+#[cfg(windows)]
+mod portable_update;
 mod terminal;
 
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    fmt::Write as FmtWrite,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -18,6 +21,9 @@ use tauri::{ipc::Channel, AppHandle, Manager, State, Url};
 use tauri_plugin_updater::UpdaterExt;
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_HEX_VIEW_BYTES: usize = 512 * 1024;
+const HEX_VIEW_BYTES_PER_LINE: usize = 16;
+const MAX_STANDALONE_FILES: usize = 256;
 const MAX_TREE_ENTRIES: usize = 20_000;
 const MAX_TREE_DEPTH: usize = 32;
 const MAX_WORKSPACE_ROOTS: usize = 8;
@@ -31,6 +37,10 @@ const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/mkkima/NullPointerIDE/releases?per_page=20";
 const GITHUB_RELEASE_RESPONSE_LIMIT: u64 = 2 * 1024 * 1024;
 const UPDATE_MANIFEST_NAME: &str = "latest.json";
+const PORTABLE_UPDATE_MANIFEST_NAME: &str = "portable-latest.json";
+const PORTABLE_UPDATE_TARGET: &str = "windows-x86_64";
+const PORTABLE_LATEST_UPDATE_URL: &str =
+    "https://github.com/mkkima/NullPointerIDE/releases/latest/download/portable-latest.json";
 const PORTABLE_MARKER_NAME: &str = "portable.flag";
 const PORTABLE_DATA_DIRECTORY: &str = "data";
 
@@ -56,6 +66,8 @@ struct GitCommitResult {
 struct AppState {
     workspace_roots: RwLock<Vec<WorkspaceRoot>>,
     next_workspace_root_id: AtomicU64,
+    standalone_files: RwLock<HashMap<String, PathBuf>>,
+    next_standalone_file_id: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +111,11 @@ impl RuntimeMode {
         self.portable_root
             .as_ref()
             .map(|root| root.join(PORTABLE_DATA_DIRECTORY))
+    }
+
+    #[cfg(windows)]
+    fn portable_root(&self) -> Option<&Path> {
+        self.portable_root.as_deref()
     }
 }
 
@@ -170,6 +187,32 @@ struct FileDocument {
     content: String,
     modified_at_ms: u64,
     size: u64,
+    read_only: bool,
+    truncated: bool,
+    view_mode: FileViewMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum FileViewMode {
+    Text,
+    Utf16,
+    Hex,
+}
+
+struct DecodedFileView {
+    content: String,
+    read_only: bool,
+    truncated: bool,
+    view_mode: FileViewMode,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StandaloneFileDocument {
+    file_id: String,
+    display_path: String,
+    document: FileDocument,
 }
 
 #[derive(Debug, Serialize)]
@@ -385,7 +428,7 @@ fn is_portable_build(mode: State<'_, RuntimeMode>) -> bool {
 }
 
 #[tauri::command]
-async fn list_app_releases() -> CommandResult<Vec<AppRelease>> {
+async fn list_app_releases(runtime_mode: State<'_, RuntimeMode>) -> CommandResult<Vec<AppRelease>> {
     ensure_tls_provider();
     let client = reqwest::Client::builder()
         .user_agent(format!("NullPointerIDE/{}", env!("CARGO_PKG_VERSION")))
@@ -451,8 +494,52 @@ async fn list_app_releases() -> CommandResult<Vec<AppRelease>> {
     Ok(releases
         .into_iter()
         .filter(|release| !release.draft && !release.prerelease)
-        .filter_map(app_release_from_github)
+        .filter_map(|release| app_release_from_github(release, runtime_mode.is_portable()))
         .collect())
+}
+
+#[tauri::command]
+async fn check_portable_update(
+    app: AppHandle,
+    runtime_mode: State<'_, RuntimeMode>,
+) -> CommandResult<Option<String>> {
+    if cfg!(debug_assertions) || !runtime_mode.is_portable() {
+        return Ok(None);
+    }
+
+    let endpoint = Url::parse(PORTABLE_LATEST_UPDATE_URL).map_err(|error| {
+        CommandError::new(
+            "update_configuration_error",
+            format!("Could not build the portable update URL: {error}"),
+        )
+    })?;
+    let updater = app
+        .updater_builder()
+        .target(PORTABLE_UPDATE_TARGET)
+        .endpoints(vec![endpoint])
+        .map_err(|error| {
+            CommandError::new(
+                "update_configuration_error",
+                format!("Could not select the portable update feed: {error}"),
+            )
+        })?
+        .build()
+        .map_err(|error| {
+            CommandError::new(
+                "update_configuration_error",
+                format!("Could not prepare the portable updater: {error}"),
+            )
+        })?;
+    updater
+        .check()
+        .await
+        .map(|update| update.map(|update| update.version))
+        .map_err(|error| {
+            CommandError::new(
+                "update_check_error",
+                format!("Could not check for a signed portable update: {error}"),
+            )
+        })
 }
 
 #[tauri::command]
@@ -469,13 +556,6 @@ async fn install_app_version(
             "Version installation is available only in a packaged production build.",
         ));
     }
-    if runtime_mode.is_portable() {
-        return Err(CommandError::new(
-            "portable_update_unsupported",
-            "Portable builds are updated by replacing the application folder with a newer portable release.",
-        ));
-    }
-
     let requested = semver::Version::parse(version.trim()).map_err(|_| {
         CommandError::new(
             "invalid_update_version",
@@ -493,6 +573,26 @@ async fn install_app_version(
         ));
     }
     let _guard = UpdateInstallGuard(&update_state.installing);
+
+    if runtime_mode.is_portable() {
+        #[cfg(windows)]
+        {
+            let portable_root = runtime_mode.portable_root().ok_or_else(|| {
+                CommandError::new(
+                    "portable_update_error",
+                    "Could not locate the portable application folder.",
+                )
+            })?;
+            return install_portable_app_version(&app, portable_root, requested, on_event).await;
+        }
+        #[cfg(not(windows))]
+        {
+            return Err(CommandError::new(
+                "portable_update_unsupported",
+                "Portable updates are currently available only on Windows.",
+            ));
+        }
+    }
 
     let endpoint = update_manifest_url(&requested)?;
     let selected = requested.clone();
@@ -564,66 +664,212 @@ async fn install_app_version(
     app.restart();
 }
 
+#[cfg(windows)]
+async fn install_portable_app_version(
+    app: &AppHandle,
+    portable_root: &Path,
+    requested: semver::Version,
+    on_event: Channel<AppUpdateEvent>,
+) -> CommandResult<()> {
+    let endpoint = portable_update_manifest_url(&requested)?;
+    let selected = requested.clone();
+    let updater = app
+        .updater_builder()
+        .target(PORTABLE_UPDATE_TARGET)
+        .endpoints(vec![endpoint])
+        .map_err(|error| {
+            CommandError::new(
+                "update_configuration_error",
+                format!("Could not select the requested portable update: {error}"),
+            )
+        })?
+        .version_comparator(move |current, release| {
+            release.version == selected && release.version != current
+        })
+        .build()
+        .map_err(|error| {
+            CommandError::new(
+                "update_configuration_error",
+                format!("Could not prepare the portable updater: {error}"),
+            )
+        })?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                "update_check_error",
+                format!("Could not verify the selected portable version: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            CommandError::new(
+                "update_unavailable",
+                "This portable version is already installed or no longer available.",
+            )
+        })?;
+    if update.version != requested.to_string() {
+        return Err(CommandError::new(
+            "update_version_mismatch",
+            "The signed portable update does not match the selected version.",
+        ));
+    }
+
+    let progress_events = on_event.clone();
+    let mut started = false;
+    let executable = update
+        .download(
+            move |chunk_length, content_length| {
+                if !started {
+                    started = true;
+                    let _ = progress_events.send(AppUpdateEvent::Started { content_length });
+                }
+                let _ = progress_events.send(AppUpdateEvent::Progress { chunk_length });
+            },
+            || {},
+        )
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                "update_download_error",
+                format!("Could not download and verify the portable update: {error}"),
+            )
+        })?;
+    if executable.len() > portable_update::MAX_EXECUTABLE_BYTES {
+        return Err(CommandError::new(
+            "update_too_large",
+            "The signed portable update exceeds the application size limit.",
+        ));
+    }
+
+    portable_update::stage_and_launch(portable_root, &executable, &requested.to_string()).map_err(
+        |error| {
+            CommandError::new(
+                "portable_update_error",
+                format!("Could not prepare the portable update: {error}"),
+            )
+        },
+    )?;
+    let _ = on_event.send(AppUpdateEvent::Finished);
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 fn refresh_project(state: State<'_, AppState>) -> CommandResult<WorkspaceSnapshot> {
     build_workspace_snapshot(&workspace_roots(&state)?)
 }
 
 #[tauri::command]
-fn read_project_file(
+async fn read_project_file(
     root_id: String,
     relative_path: String,
     state: State<'_, AppState>,
 ) -> CommandResult<FileDocument> {
     let root = workspace_root_by_id(&state, &root_id)?.path;
     let normalized = normalize_relative(&relative_path)?;
-    let path = resolve_existing_file(&root, &normalized)?;
-    let metadata = fs::metadata(&path)
+    tauri::async_runtime::spawn_blocking(move || load_project_file(&root, &normalized))
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                "file_task_error",
+                format!("The file preview task failed: {error}"),
+            )
+        })?
+}
+
+fn load_project_file(root: &Path, normalized: &Path) -> CommandResult<FileDocument> {
+    let path = resolve_existing_file(root, normalized)?;
+    load_file_document(&path, path_to_relative_string(normalized))
+}
+
+fn load_file_document(path: &Path, document_path: String) -> CommandResult<FileDocument> {
+    let metadata = fs::metadata(path)
         .map_err(|error| CommandError::io("Could not inspect the file", error))?;
 
-    if metadata.len() > MAX_FILE_BYTES {
-        return Err(CommandError::new(
-            "file_too_large",
-            format!(
-                "This file is larger than the {} MiB editor limit.",
-                MAX_FILE_BYTES / 1024 / 1024
-            ),
-        ));
-    }
-
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(&path)
+    let capacity =
+        usize::try_from(metadata.len().min(MAX_FILE_BYTES)).unwrap_or(MAX_FILE_BYTES as usize);
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(path)
         .map_err(|error| CommandError::io("Could not open the file", error))?
-        .take(MAX_FILE_BYTES + 1)
+        .take(MAX_FILE_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|error| CommandError::io("Could not read the file", error))?;
 
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err(CommandError::new(
-            "file_too_large",
-            "The file grew beyond the editor limit while it was being read.",
-        ));
-    }
-    if bytes.iter().take(8_192).any(|byte| *byte == 0) {
-        return Err(CommandError::new(
-            "binary_file",
-            "Binary files cannot be opened in the text editor.",
-        ));
-    }
-
-    let content = String::from_utf8(bytes).map_err(|_| {
-        CommandError::new(
-            "unsupported_encoding",
-            "The file is not valid UTF-8. Convert it to UTF-8 before editing.",
-        )
-    })?;
+    let final_metadata = fs::metadata(path)
+        .map_err(|error| CommandError::io("Could not inspect the loaded file", error))?;
+    let file_truncated = final_metadata.len() > bytes.len() as u64;
+    let view = decode_file_view(bytes, file_truncated);
 
     Ok(FileDocument {
-        path: path_to_relative_string(&normalized),
-        content,
-        modified_at_ms: modified_at_ms(&metadata)?,
-        size: metadata.len(),
+        path: document_path,
+        content: view.content,
+        modified_at_ms: modified_at_ms(&final_metadata)?,
+        size: final_metadata.len(),
+        read_only: view.read_only,
+        truncated: view.truncated,
+        view_mode: view.view_mode,
     })
+}
+
+#[tauri::command]
+async fn open_standalone_file(
+    path: String,
+    state: State<'_, AppState>,
+) -> CommandResult<StandaloneFileDocument> {
+    let path = canonicalize_standalone_file(&path)?;
+    let display_path = path_to_display_string(&path);
+    let document_path = standalone_file_name(&path);
+    let load_path = path.clone();
+    let document =
+        tauri::async_runtime::spawn_blocking(move || load_file_document(&load_path, document_path))
+            .await
+            .map_err(|error| {
+                CommandError::new(
+                    "file_task_error",
+                    format!("The standalone file task failed: {error}"),
+                )
+            })??;
+    let file_id = register_standalone_file(&state, path)?;
+    Ok(StandaloneFileDocument {
+        file_id,
+        display_path,
+        document,
+    })
+}
+
+#[tauri::command]
+async fn read_standalone_file(
+    file_id: String,
+    state: State<'_, AppState>,
+) -> CommandResult<StandaloneFileDocument> {
+    let path = standalone_file_by_id(&state, &file_id)?;
+    let display_path = path_to_display_string(&path);
+    let document_path = standalone_file_name(&path);
+    let document =
+        tauri::async_runtime::spawn_blocking(move || load_file_document(&path, document_path))
+            .await
+            .map_err(|error| {
+                CommandError::new(
+                    "file_task_error",
+                    format!("The standalone file task failed: {error}"),
+                )
+            })??;
+    Ok(StandaloneFileDocument {
+        file_id,
+        display_path,
+        document,
+    })
+}
+
+#[tauri::command]
+fn close_standalone_file(file_id: String, state: State<'_, AppState>) -> CommandResult<()> {
+    let mut files = state
+        .standalone_files
+        .write()
+        .map_err(|_| CommandError::new("state_error", "Standalone file state is unavailable."))?;
+    files.remove(&file_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -633,6 +879,28 @@ fn write_project_file(
     content: String,
     expected_modified_at_ms: Option<u64>,
     state: State<'_, AppState>,
+) -> CommandResult<SaveResult> {
+    let root = workspace_root_by_id(&state, &root_id)?.path;
+    let normalized = normalize_relative(&relative_path)?;
+    let path = resolve_existing_file(&root, &normalized)?;
+    write_text_file(&path, &content, expected_modified_at_ms)
+}
+
+#[tauri::command]
+fn write_standalone_file(
+    file_id: String,
+    content: String,
+    expected_modified_at_ms: Option<u64>,
+    state: State<'_, AppState>,
+) -> CommandResult<SaveResult> {
+    let path = standalone_file_by_id(&state, &file_id)?;
+    write_text_file(&path, &content, expected_modified_at_ms)
+}
+
+fn write_text_file(
+    path: &Path,
+    content: &str,
+    expected_modified_at_ms: Option<u64>,
 ) -> CommandResult<SaveResult> {
     if content.len() as u64 > MAX_FILE_BYTES {
         return Err(CommandError::new(
@@ -644,10 +912,7 @@ fn write_project_file(
         ));
     }
 
-    let root = workspace_root_by_id(&state, &root_id)?.path;
-    let normalized = normalize_relative(&relative_path)?;
-    let path = resolve_existing_file(&root, &normalized)?;
-    let metadata = fs::metadata(&path)
+    let metadata = fs::metadata(path)
         .map_err(|error| CommandError::io("Could not inspect the file", error))?;
 
     if let Some(expected) = expected_modified_at_ms {
@@ -658,6 +923,28 @@ fn write_project_file(
                 "The file changed on disk after it was opened. Reopen it before saving.",
             ));
         }
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(CommandError::new(
+            "read_only_file",
+            "Large file previews are read-only.",
+        ));
+    }
+    let mut existing_bytes =
+        Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(MAX_FILE_BYTES as usize));
+    File::open(path)
+        .map_err(|error| CommandError::io("Could not verify the file encoding", error))?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut existing_bytes)
+        .map_err(|error| CommandError::io("Could not verify the file encoding", error))?;
+    if existing_bytes.len() as u64 > MAX_FILE_BYTES
+        || looks_binary(&existing_bytes)
+        || std::str::from_utf8(&existing_bytes).is_err()
+    {
+        return Err(CommandError::new(
+            "read_only_file",
+            "Binary and non-UTF-8 file previews are read-only.",
+        ));
     }
 
     let parent = path.parent().ok_or_else(|| {
@@ -677,10 +964,10 @@ fn write_project_file(
         .sync_all()
         .map_err(|error| CommandError::io("Could not flush the file", error))?;
     temporary
-        .persist(&path)
+        .persist(path)
         .map_err(|error| CommandError::io("Could not replace the original file", error.error))?;
 
-    let saved_metadata = fs::metadata(&path)
+    let saved_metadata = fs::metadata(path)
         .map_err(|error| CommandError::io("Could not inspect the saved file", error))?;
     Ok(SaveResult {
         modified_at_ms: modified_at_ms(&saved_metadata)?,
@@ -1044,12 +1331,17 @@ where
         .map_err(|message| CommandError::new("git_error", message))
 }
 
-fn app_release_from_github(release: GitHubRelease) -> Option<AppRelease> {
+fn app_release_from_github(release: GitHubRelease, portable: bool) -> Option<AppRelease> {
     let version = release_version(&release.tag_name)?;
+    let required_manifest = if portable {
+        PORTABLE_UPDATE_MANIFEST_NAME
+    } else {
+        UPDATE_MANIFEST_NAME
+    };
     let update_available = release
         .assets
         .iter()
-        .any(|asset| asset.name.eq_ignore_ascii_case(UPDATE_MANIFEST_NAME));
+        .any(|asset| asset.name.eq_ignore_ascii_case(required_manifest));
     let default_name = format!("NullPointer {version}");
     Some(AppRelease {
         version,
@@ -1093,6 +1385,18 @@ fn update_manifest_url(version: &semver::Version) -> CommandResult<Url> {
         CommandError::new(
             "update_configuration_error",
             format!("Could not build the selected update URL: {error}"),
+        )
+    })
+}
+
+fn portable_update_manifest_url(version: &semver::Version) -> CommandResult<Url> {
+    Url::parse(&format!(
+        "https://github.com/mkkima/NullPointerIDE/releases/download/app-v{version}/{PORTABLE_UPDATE_MANIFEST_NAME}"
+    ))
+    .map_err(|error| {
+        CommandError::new(
+            "update_configuration_error",
+            format!("Could not build the selected portable update URL: {error}"),
         )
     })
 }
@@ -1320,6 +1624,65 @@ fn workspace_roots(state: &State<'_, AppState>) -> CommandResult<Vec<WorkspaceRo
         .map(|roots| roots.clone())
 }
 
+fn canonicalize_standalone_file(path: &str) -> CommandResult<PathBuf> {
+    let file = fs::canonicalize(Path::new(path))
+        .map_err(|error| CommandError::io("Could not open the selected file", error))?;
+    if !file.is_file() {
+        return Err(CommandError::new(
+            "not_a_file",
+            "The selected path is not a regular file.",
+        ));
+    }
+    Ok(file)
+}
+
+fn register_standalone_file(state: &State<'_, AppState>, path: PathBuf) -> CommandResult<String> {
+    let mut files = state
+        .standalone_files
+        .write()
+        .map_err(|_| CommandError::new("state_error", "Standalone file state is unavailable."))?;
+    if let Some((file_id, _)) = files
+        .iter()
+        .find(|(_, candidate)| candidate.as_path() == path.as_path())
+    {
+        return Ok(file_id.clone());
+    }
+    if files.len() >= MAX_STANDALONE_FILES {
+        return Err(CommandError::new(
+            "standalone_file_limit",
+            "Close an existing standalone file before opening another one.",
+        ));
+    }
+    let sequence = state
+        .next_standalone_file_id
+        .fetch_add(1, AtomicOrdering::Relaxed)
+        .saturating_add(1);
+    let file_id = format!("standalone-{sequence}");
+    files.insert(file_id.clone(), path);
+    Ok(file_id)
+}
+
+fn standalone_file_by_id(state: &State<'_, AppState>, file_id: &str) -> CommandResult<PathBuf> {
+    state
+        .standalone_files
+        .read()
+        .map_err(|_| CommandError::new("state_error", "Standalone file state is unavailable."))?
+        .get(file_id)
+        .cloned()
+        .ok_or_else(|| {
+            CommandError::new(
+                "standalone_file_not_found",
+                "The standalone file is no longer open.",
+            )
+        })
+}
+
+fn standalone_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path_to_display_string(path))
+}
+
 fn workspace_root_by_id(
     state: &State<'_, AppState>,
     root_id: &str,
@@ -1466,6 +1829,120 @@ fn walk_directory(
     Ok(entries)
 }
 
+fn decode_file_view(bytes: Vec<u8>, file_truncated: bool) -> DecodedFileView {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        return decode_utf16_view(&bytes[2..], true, file_truncated);
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        return decode_utf16_view(&bytes[2..], false, file_truncated);
+    }
+
+    if !looks_binary(&bytes) {
+        match String::from_utf8(bytes) {
+            Ok(content) => {
+                return DecodedFileView {
+                    content,
+                    read_only: file_truncated,
+                    truncated: file_truncated,
+                    view_mode: FileViewMode::Text,
+                };
+            }
+            Err(error)
+                if file_truncated
+                    && error.utf8_error().error_len().is_none()
+                    && error.utf8_error().valid_up_to() > 0 =>
+            {
+                let valid = error.utf8_error().valid_up_to();
+                let mut bytes = error.into_bytes();
+                bytes.truncate(valid);
+                let content =
+                    String::from_utf8(bytes).expect("the UTF-8 validator reported a valid prefix");
+                return DecodedFileView {
+                    content,
+                    read_only: true,
+                    truncated: true,
+                    view_mode: FileViewMode::Text,
+                };
+            }
+            Err(error) => return binary_file_view(&error.into_bytes(), file_truncated),
+        }
+    }
+
+    binary_file_view(&bytes, file_truncated)
+}
+
+fn decode_utf16_view(bytes: &[u8], little_endian: bool, file_truncated: bool) -> DecodedFileView {
+    let complete_length = bytes.len() - (bytes.len() % 2);
+    let units = bytes[..complete_length].chunks_exact(2).map(|chunk| {
+        let pair = [chunk[0], chunk[1]];
+        if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    });
+    let content = char::decode_utf16(units)
+        .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    DecodedFileView {
+        content,
+        read_only: true,
+        truncated: file_truncated || complete_length != bytes.len(),
+        view_mode: FileViewMode::Utf16,
+    }
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    let sample = &bytes[..bytes.len().min(32 * 1024)];
+    if sample.is_empty() {
+        return false;
+    }
+    let controls = sample
+        .iter()
+        .filter(|byte| **byte < 0x20 && !matches!(**byte, b'\n' | b'\r' | b'\t' | 0x0c))
+        .count();
+    sample.contains(&0) || controls.saturating_mul(10) > sample.len()
+}
+
+fn binary_file_view(bytes: &[u8], file_truncated: bool) -> DecodedFileView {
+    let visible = &bytes[..bytes.len().min(MAX_HEX_VIEW_BYTES)];
+    DecodedFileView {
+        content: hexadecimal_text_view(visible),
+        read_only: true,
+        truncated: file_truncated || visible.len() != bytes.len(),
+        view_mode: FileViewMode::Hex,
+    }
+}
+
+fn hexadecimal_text_view(bytes: &[u8]) -> String {
+    let line_count = bytes.len().div_ceil(HEX_VIEW_BYTES_PER_LINE);
+    let mut output = String::with_capacity(line_count.saturating_mul(78));
+    for (line_index, chunk) in bytes.chunks(HEX_VIEW_BYTES_PER_LINE).enumerate() {
+        let offset = line_index.saturating_mul(HEX_VIEW_BYTES_PER_LINE);
+        let _ = write!(output, "{offset:08x}  ");
+        for index in 0..HEX_VIEW_BYTES_PER_LINE {
+            if let Some(byte) = chunk.get(index) {
+                let _ = write!(output, "{byte:02x} ");
+            } else {
+                output.push_str("   ");
+            }
+            if index == 7 {
+                output.push(' ');
+            }
+        }
+        output.push_str(" |");
+        for byte in chunk {
+            output.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                char::from(*byte)
+            } else {
+                '.'
+            });
+        }
+        output.push_str("|\n");
+    }
+    output
+}
+
 fn normalize_relative(input: &str) -> CommandResult<PathBuf> {
     let value = input.trim();
     if value.is_empty() {
@@ -1585,7 +2062,16 @@ fn path_to_display_string(path: &Path) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    if portable_update::run_helper_if_requested() {
+        return;
+    }
+
     let runtime_mode = RuntimeMode::detect();
+    #[cfg(windows)]
+    let portable_health_file = portable_update::health_file_argument();
+    #[cfg(windows)]
+    let setup_runtime_mode = runtime_mode.clone();
     let portable_webview_directory = runtime_mode
         .data_directory()
         .map(|directory| directory.join("webview"));
@@ -1609,6 +2095,10 @@ pub fn run() {
                     .data_directory(data_directory)
                     .build()?;
             }
+            #[cfg(windows)]
+            if let Some(portable_root) = setup_runtime_mode.portable_root() {
+                portable_update::acknowledge_healthy_launch(portable_root, portable_health_file);
+            }
             Ok(())
         })
         .manage(AppState::default())
@@ -1619,6 +2109,7 @@ pub fn run() {
             is_production_build,
             is_portable_build,
             list_app_releases,
+            check_portable_update,
             install_app_version,
             open_project,
             add_workspace_folder,
@@ -1626,6 +2117,10 @@ pub fn run() {
             refresh_project,
             read_project_file,
             write_project_file,
+            open_standalone_file,
+            read_standalone_file,
+            write_standalone_file,
+            close_standalone_file,
             create_project_entry,
             load_research_state,
             save_research_state,
@@ -1696,9 +2191,15 @@ mod tests {
     fn builds_a_version_specific_update_manifest_url() {
         let version = semver::Version::parse("1.2.3").expect("fixture should be valid");
         let url = update_manifest_url(&version).expect("URL should be valid");
+        let portable_url =
+            portable_update_manifest_url(&version).expect("portable URL should be valid");
         assert_eq!(
             url.as_str(),
             "https://github.com/mkkima/NullPointerIDE/releases/download/app-v1.2.3/latest.json"
+        );
+        assert_eq!(
+            portable_url.as_str(),
+            "https://github.com/mkkima/NullPointerIDE/releases/download/app-v1.2.3/portable-latest.json"
         );
     }
 
@@ -1706,6 +2207,121 @@ mod tests {
     fn converts_paths_to_slash_separated_strings() {
         let path = PathBuf::from("src").join("editor").join("mod.rs");
         assert_eq!(path_to_relative_string(&path), "src/editor/mod.rs");
+    }
+
+    #[test]
+    fn keeps_valid_utf8_files_editable() {
+        let view = decode_file_view("Hello, мир\n".as_bytes().to_vec(), false);
+
+        assert_eq!(view.view_mode, FileViewMode::Text);
+        assert_eq!(
+            serde_json::to_string(&view.view_mode).expect("view mode should serialize"),
+            "\"text\""
+        );
+        assert_eq!(view.content, "Hello, мир\n");
+        assert!(!view.read_only);
+        assert!(!view.truncated);
+    }
+
+    #[test]
+    fn decodes_utf16_files_without_allowing_destructive_saves() {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "Hello, мир".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let view = decode_file_view(bytes, false);
+
+        assert_eq!(view.view_mode, FileViewMode::Utf16);
+        assert_eq!(
+            serde_json::to_string(&view.view_mode).expect("view mode should serialize"),
+            "\"utf16\""
+        );
+        assert_eq!(view.content, "Hello, мир");
+        assert!(view.read_only);
+        assert!(!view.truncated);
+    }
+
+    #[test]
+    fn represents_binary_files_as_read_only_hex_text() {
+        let view = decode_file_view(
+            vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00],
+            false,
+        );
+
+        assert_eq!(view.view_mode, FileViewMode::Hex);
+        assert!(view.content.starts_with("00000000  89 50 4e 47"));
+        assert!(view.content.contains("|.PNG.....|"));
+        assert!(view.read_only);
+        assert!(!view.truncated);
+    }
+
+    #[test]
+    fn caps_binary_text_views_to_a_bounded_size() {
+        let bytes = vec![0; MAX_HEX_VIEW_BYTES + 1];
+        let view = decode_file_view(bytes, false);
+
+        assert_eq!(view.view_mode, FileViewMode::Hex);
+        assert!(view.truncated);
+        assert_eq!(
+            view.content.lines().count(),
+            MAX_HEX_VIEW_BYTES / HEX_VIEW_BYTES_PER_LINE
+        );
+    }
+
+    #[test]
+    fn preserves_the_valid_prefix_of_a_truncated_utf8_file() {
+        let view = decode_file_view(vec![b'H', b'i', b' ', 0xe2, 0x82], true);
+
+        assert_eq!(view.view_mode, FileViewMode::Text);
+        assert_eq!(view.content, "Hi ");
+        assert!(view.read_only);
+        assert!(view.truncated);
+    }
+
+    #[test]
+    fn loads_an_individual_file_without_a_workspace_root() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("notes.txt");
+        fs::write(&path, "standalone text").expect("fixture should be written");
+
+        let document = load_file_document(&path, "notes.txt".to_owned()).expect("file should load");
+
+        assert_eq!(document.path, "notes.txt");
+        assert_eq!(document.content, "standalone text");
+        assert!(!document.read_only);
+        assert_eq!(document.view_mode, FileViewMode::Text);
+    }
+
+    #[test]
+    fn standalone_text_saves_use_the_same_conflict_safe_writer() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("notes.txt");
+        fs::write(&path, "before").expect("fixture should be written");
+        let metadata = fs::metadata(&path).expect("fixture should be inspectable");
+        let modified = modified_at_ms(&metadata).expect("timestamp should be valid");
+
+        write_text_file(&path, "after", Some(modified)).expect("text file should save");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("saved file should be readable"),
+            "after"
+        );
+    }
+
+    #[test]
+    fn standalone_binary_views_cannot_be_overwritten_as_text() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("image.bin");
+        fs::write(&path, [0x00, 0x01, 0x02, 0xff]).expect("fixture should be written");
+
+        let error =
+            write_text_file(&path, "replacement", None).expect_err("binary save should fail");
+
+        assert_eq!(error.code, "read_only_file");
+        assert_eq!(
+            fs::read(&path).expect("binary fixture should remain readable"),
+            [0x00, 0x01, 0x02, 0xff]
+        );
     }
 
     #[test]

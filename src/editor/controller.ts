@@ -20,7 +20,7 @@ import {
   lineNumbers,
   rectangularSelection,
 } from "@codemirror/view";
-import type { FileDocument } from "../types";
+import type { FileDocument, FileViewMode } from "../types";
 import { languageExtension } from "./languages";
 import { editorTheme } from "./theme";
 
@@ -29,10 +29,15 @@ interface Session {
   savedContent: string;
   modifiedAtMs: number;
   size: number;
+  dirty: boolean;
+  readOnly: boolean;
+  truncated: boolean;
+  viewMode: FileViewMode;
 }
 
 interface EditorCallbacks {
   readonly onDirtyChange: (path: string, dirty: boolean) => void;
+  readonly onDocumentChange: (path: string, content: string) => void;
   readonly onCursorChange: (line: number, column: number) => void;
 }
 
@@ -98,7 +103,8 @@ export class EditorController {
       return true;
     }
 
-    const language = await languageExtension(document.path);
+    const language: Extension =
+      document.viewMode === "hex" ? [] : await languageExtension(document.path);
     if (!shouldCommit()) return false;
     let session: Session;
     const state = EditorState.create({
@@ -106,13 +112,17 @@ export class EditorController {
       extensions: [
         ...commonExtensions,
         language,
+        EditorState.readOnly.of(document.readOnly),
         EditorView.updateListener.of((update) => {
           session.state = update.state;
           if (update.docChanged) {
-            this.callbacks.onDirtyChange(
-              document.path,
-              update.state.doc.toString() !== session.savedContent,
-            );
+            const content = update.state.doc.toString();
+            const dirty = content !== session.savedContent;
+            if (dirty !== session.dirty) {
+              session.dirty = dirty;
+              this.callbacks.onDirtyChange(document.path, dirty);
+            }
+            this.callbacks.onDocumentChange(document.path, content);
           }
           if ((update.selectionSet || update.docChanged) && this.activePath === document.path) {
             this.emitCursor(update.state);
@@ -125,6 +135,10 @@ export class EditorController {
       savedContent: document.content,
       modifiedAtMs: document.modifiedAtMs,
       size: document.size,
+      dirty: false,
+      readOnly: document.readOnly,
+      truncated: document.truncated,
+      viewMode: document.viewMode,
     };
     this.sessions.set(document.path, session);
     this.activate(document.path);
@@ -150,8 +164,19 @@ export class EditorController {
   }
 
   isDirty(path: string): boolean {
-    const session = this.sessions.get(path);
-    return session ? session.state.doc.toString() !== session.savedContent : false;
+    return this.sessions.get(path)?.dirty ?? false;
+  }
+
+  isReadOnly(path: string): boolean {
+    return this.sessions.get(path)?.readOnly ?? true;
+  }
+
+  isTruncated(path: string): boolean {
+    return this.sessions.get(path)?.truncated ?? false;
+  }
+
+  viewMode(path: string): FileViewMode | null {
+    return this.sessions.get(path)?.viewMode ?? null;
   }
 
   markSaved(path: string, modifiedAtMs: number, size: number): void {
@@ -160,7 +185,10 @@ export class EditorController {
     session.savedContent = session.state.doc.toString();
     session.modifiedAtMs = modifiedAtMs;
     session.size = size;
-    this.callbacks.onDirtyChange(path, false);
+    if (session.dirty) {
+      session.dirty = false;
+      this.callbacks.onDirtyChange(path, false);
+    }
   }
 
   close(path: string): void {

@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: nullpointer-release-main
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   release-windows:
@@ -60,7 +60,7 @@ jobs:
           releaseBody: |
             Automatic build from `${{ github.sha }}`.
             Includes a Windows x64 installer, Windows portable ZIP, and macOS Apple Silicon DMG.
-            Installed copies of NullPointer will receive this update automatically.
+            Installed and portable Windows copies of NullPointer receive signed updates automatically.
           releaseDraft: false
           prerelease: false
           releaseCommitish: ${{ github.sha }}
@@ -68,18 +68,51 @@ jobs:
 
       - name: Package portable Windows build
         shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
           $binary = Resolve-Path "src-tauri\target\release\nullpointer-ide.exe"
           $package = Join-Path $env:RUNNER_TEMP "NullPointer-Portable"
           $archive = Join-Path $env:RUNNER_TEMP "NullPointer_${env:APP_VERSION}_windows_x64_portable.zip"
+          $portableBinary = Join-Path $env:RUNNER_TEMP "NullPointer_${env:APP_VERSION}_windows_x64_portable.exe"
+          $portableManifest = Join-Path $env:RUNNER_TEMP "portable-latest.json"
 
           New-Item -ItemType Directory -Path $package -Force | Out-Null
-          Copy-Item -LiteralPath $binary -Destination (Join-Path $package "NullPointer.exe")
+          Copy-Item -LiteralPath $binary -Destination $portableBinary
+          Copy-Item -LiteralPath $portableBinary -Destination (Join-Path $package "NullPointer.exe")
           Copy-Item -LiteralPath "packaging\portable\portable.flag" -Destination $package
           Copy-Item -LiteralPath "packaging\portable\README.txt" -Destination $package
           Compress-Archive -LiteralPath $package -DestinationPath $archive -CompressionLevel Optimal
 
+          npx tauri signer sign $portableBinary
+          $signaturePath = "$portableBinary.sig"
+          if (-not (Test-Path -LiteralPath $signaturePath -PathType Leaf)) {
+            throw "The portable executable signature was not created."
+          }
+          $signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($signature)) {
+            throw "The portable executable signature is empty."
+          }
+
+          $assetName = Split-Path -Leaf $portableBinary
+          $manifest = [ordered]@{
+            version = $env:APP_VERSION
+            notes = "Automatic portable build from ${{ github.sha }}."
+            pub_date = (Get-Date).ToUniversalTime().ToString("o")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = $signature
+                url = "https://github.com/mkkima/NullPointerIDE/releases/download/app-v$env:APP_VERSION/$assetName"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $portableManifest -Encoding utf8 -NoNewline
+
           "PORTABLE_ARCHIVE=$archive" >> $env:GITHUB_ENV
+          "PORTABLE_BINARY=$portableBinary" >> $env:GITHUB_ENV
+          "PORTABLE_SIGNATURE=$signaturePath" >> $env:GITHUB_ENV
+          "PORTABLE_MANIFEST=$portableManifest" >> $env:GITHUB_ENV
 
       - name: Publish portable Windows build
         shell: pwsh
@@ -88,6 +121,9 @@ jobs:
         run: |
           gh release upload "app-v$env:APP_VERSION" `
             "$env:PORTABLE_ARCHIVE#NullPointer Portable for Windows x64" `
+            "$env:PORTABLE_BINARY#Signed NullPointer portable executable for automatic updates" `
+            "$env:PORTABLE_SIGNATURE#Portable executable signature" `
+            "$env:PORTABLE_MANIFEST#Portable automatic update manifest" `
             --clobber
 
   release-macos:
@@ -133,7 +169,7 @@ jobs:
           releaseBody: |
             Automatic build from `${{ github.sha }}`.
             Includes a Windows x64 installer, Windows portable ZIP, and macOS Apple Silicon DMG.
-            Installed copies of NullPointer will receive this update automatically.
+            Installed and portable Windows copies of NullPointer receive signed updates automatically.
           releaseDraft: false
           prerelease: false
           releaseCommitish: ${{ github.sha }}

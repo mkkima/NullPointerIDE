@@ -1,13 +1,16 @@
 import "@fontsource-variable/inter";
 import "./styles/main.css";
 import { EditorController } from "./editor/controller";
+import { MarkdownPreviewController } from "./markdown/controller";
 import { ResearchController } from "./research/controller";
 import { TerminalController } from "./terminal/controller";
 import { checkAndInstallUpdate } from "./services/updater";
 import { UpdatesController } from "./updates/controller";
 import {
   addWorkspaceFolder,
+  chooseStandaloneFile,
   chooseProjectFolder,
+  closeStandaloneFile,
   createProjectEntry,
   getGitWorkspace,
   gitCommitRepository,
@@ -15,15 +18,20 @@ import {
   gitStageFile,
   gitUnstageFile,
   openProject,
+  openStandaloneFile,
   readProjectFile,
+  readStandaloneFile,
   refreshProject,
   removeWorkspaceFolder,
   toAppError,
   writeProjectFile,
+  writeStandaloneFile,
 } from "./services/native";
+import type { StandaloneFileDocument } from "./services/native";
 import type {
   CreateKind,
   FileEntry,
+  FileDocument,
   GitCommitAction,
   GitFileChange,
   GitRepository,
@@ -102,7 +110,9 @@ class NullPointerApp {
   private readonly tree = element<HTMLElement>("#file-tree");
   private readonly tabs = element<HTMLElement>("#tabs");
   private readonly welcome = element<HTMLElement>("#welcome");
+  private readonly editorLayout = element<HTMLElement>("#editor-layout");
   private readonly editorHost = element<HTMLElement>("#editor-host");
+  private readonly markdownPreviewPanel = element<HTMLElement>("#markdown-preview-panel");
   private readonly cursorStatus = element<HTMLElement>("#cursor-status");
   private readonly languageStatus = element<HTMLElement>("#language-status");
   private readonly generalStatus = element<HTMLElement>("#general-status");
@@ -117,6 +127,7 @@ class NullPointerApp {
   private readonly entryInput = element<HTMLInputElement>("#entry-path");
   private readonly entryError = element<HTMLElement>("#entry-error");
   private readonly editor: EditorController;
+  private readonly markdownPreview: MarkdownPreviewController;
   private readonly research: ResearchController;
   private readonly terminal: TerminalController;
   private readonly updates: UpdatesController;
@@ -131,6 +142,10 @@ class NullPointerApp {
   private readonly commitMessages = new Map<string, string>();
   private readonly dirty = new Set<string>();
   private readonly loadingFiles = new Set<string>();
+  private readonly standaloneFiles = new Map<
+    string,
+    { readonly fileId: string; readonly displayPath: string }
+  >();
   private readonly disclosureAnimations = new WeakMap<HTMLElement, Animation>();
   private readonly disclosureCleanupTimers = new WeakMap<HTMLElement, number>();
   private readonly viewAnimations = new WeakMap<HTMLElement, Animation>();
@@ -159,10 +174,22 @@ class NullPointerApp {
         this.renderTabs();
         this.syncChrome();
       },
+      onDocumentChange: (path, content) => {
+        if (
+          path === this.editor.active &&
+          (extension(path) === "md" || extension(path) === "markdown")
+        ) {
+          this.markdownPreview.show(path, content);
+        }
+      },
       onCursorChange: (line, column) => {
         this.cursorStatus.textContent = `Ln ${line}, Col ${column}`;
       },
     });
+    this.markdownPreview = new MarkdownPreviewController(
+      this.editorLayout,
+      this.markdownPreviewPanel,
+    );
     this.research = new ResearchController(this.researchView, {
       onBusy: (busy, message) => this.setBusy(busy, message),
       onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
@@ -268,6 +295,12 @@ class NullPointerApp {
     });
     element<HTMLButtonElement>("#welcome-open-button").addEventListener("click", () => {
       void this.chooseAndOpenProject();
+    });
+    element<HTMLButtonElement>("#open-file-button").addEventListener("click", () => {
+      void this.chooseAndOpenStandaloneFile();
+    });
+    element<HTMLButtonElement>("#welcome-open-file-button").addEventListener("click", () => {
+      void this.chooseAndOpenStandaloneFile();
     });
     element<HTMLButtonElement>("#welcome-quick-button").addEventListener("click", () => {
       this.showQuickOpen();
@@ -408,6 +441,56 @@ class NullPointerApp {
     }
   }
 
+  private async chooseAndOpenStandaloneFile(): Promise<void> {
+    let opened: StandaloneFileDocument | null = null;
+    let busy = false;
+    try {
+      const path = await chooseStandaloneFile();
+      if (!path) return;
+      const generation = this.projectGeneration;
+      this.setBusy(true, "Opening file…");
+      busy = true;
+      opened = await openStandaloneFile(path);
+      const editorPath = opened.document.path;
+      const wasOpen = this.editor.has(editorPath);
+      if (generation !== this.projectGeneration) {
+        if (!this.standaloneFiles.has(editorPath)) {
+          void closeStandaloneFile(opened.fileId);
+        }
+        return;
+      }
+      this.standaloneFiles.set(editorPath, {
+        fileId: opened.fileId,
+        displayPath: opened.displayPath,
+      });
+      this.showEditorWorkspace();
+      const added = await this.editor.add(
+        opened.document,
+        () => generation === this.projectGeneration,
+      );
+      if (!added) {
+        if (!wasOpen) this.releaseStandaloneFile(editorPath);
+        return;
+      }
+      if (!wasOpen) this.announceFileView(opened.document);
+      this.renderTabs();
+      this.renderTree();
+      this.syncChrome();
+    } catch (error) {
+      if (
+        opened &&
+        ![...this.standaloneFiles.values()].some(
+          (standalone) => standalone.fileId === opened?.fileId,
+        )
+      ) {
+        void closeStandaloneFile(opened.fileId);
+      }
+      this.showError(error);
+    } finally {
+      if (busy) this.setBusy(false);
+    }
+  }
+
   private async chooseAndAddWorkspaceFolder(): Promise<void> {
     if (!this.project) {
       await this.chooseAndOpenProject();
@@ -457,6 +540,7 @@ class NullPointerApp {
       this.collapsedGitGroups.clear();
       this.graphRepository = null;
       this.projectGeneration += 1;
+      this.releaseAllStandaloneFiles();
       this.editor.reset();
       this.dirty.clear();
       this.expanded.clear();
@@ -509,6 +593,8 @@ class NullPointerApp {
   }
 
   private workspaceDisplayPath(path: string): string {
+    const standalone = this.standaloneFiles.get(path);
+    if (standalone) return standalone.displayPath;
     const parsed = splitWorkspaceFilePath(path);
     if (!parsed) return path;
     const root = this.project?.roots.find((candidate) => candidate.id === parsed.rootId);
@@ -1856,6 +1942,7 @@ class NullPointerApp {
       if (generation !== this.projectGeneration) return;
       const added = await this.editor.add(document, () => generation === this.projectGeneration);
       if (!added) return;
+      this.announceFileView(document);
       this.renderTabs();
       this.renderTree();
       this.syncChrome();
@@ -1875,12 +1962,15 @@ class NullPointerApp {
       tab.type = "button";
       tab.className = "tab";
       tab.dataset.path = path;
-      tab.title = this.workspaceDisplayPath(path);
+      const readOnly = this.editor.isReadOnly(path);
+      const truncated = this.editor.isTruncated(path);
+      tab.title = `${this.workspaceDisplayPath(path)}${readOnly ? " — Read-only text view" : ""}${truncated ? " — Partial preview" : ""}`;
       if (path === this.editor.active) tab.classList.add("active");
+      tab.classList.toggle("read-only", readOnly);
 
       const fileGlyph = document.createElement("span");
       fileGlyph.className = `tab-file-icon ext-${escapeSelector(extension(path) || "plain")}`;
-      fileGlyph.innerHTML = icon("code", 16);
+      fileGlyph.innerHTML = icon(this.editor.viewMode(path) === "hex" ? "file" : "code", 16);
       const label = document.createElement("span");
       label.textContent = basename(path);
       const close = document.createElement("span");
@@ -1936,6 +2026,7 @@ class NullPointerApp {
     const wasActive = this.editor.active === path;
     this.editor.close(path);
     this.dirty.delete(path);
+    this.releaseStandaloneFile(path);
     if (wasActive) {
       const remaining = [...this.editor.paths];
       const next = remaining[Math.min(Math.max(index, 0), remaining.length - 1)];
@@ -1953,6 +2044,10 @@ class NullPointerApp {
   private async saveActive(): Promise<void> {
     const path = this.editor.active;
     if (!path) return;
+    if (this.editor.isReadOnly(path)) {
+      this.toast("This file is open in a read-only text view", "neutral", 2200);
+      return;
+    }
     const content = this.editor.content(path);
     const modifiedAt = this.editor.modifiedAt(path);
     if (content === null || modifiedAt === null) return;
@@ -1963,7 +2058,14 @@ class NullPointerApp {
 
     this.setBusy(true, `Saving ${basename(path)}…`);
     try {
-      const result = await writeProjectFile(path, content, modifiedAt);
+      const standalone = this.standaloneFiles.get(path);
+      const result = standalone
+        ? await writeStandaloneFile(
+            standalone.fileId,
+            content,
+            modifiedAt,
+          )
+        : await writeProjectFile(path, content, modifiedAt);
       this.editor.markSaved(path, result.modifiedAtMs, result.size);
       this.renderTabs();
       this.syncChrome();
@@ -1985,7 +2087,17 @@ class NullPointerApp {
 
   private async reloadFile(path: string): Promise<void> {
     try {
-      const document = await readProjectFile(path);
+      const standalone = this.standaloneFiles.get(path);
+      const opened = standalone
+        ? await readStandaloneFile(standalone.fileId)
+        : null;
+      const document = opened?.document ?? (await readProjectFile(path));
+      if (opened) {
+        this.standaloneFiles.set(document.path, {
+          fileId: opened.fileId,
+          displayPath: opened.displayPath,
+        });
+      }
       this.editor.close(path);
       this.dirty.delete(path);
       await this.editor.add(document);
@@ -1995,6 +2107,21 @@ class NullPointerApp {
     } catch (error) {
       this.showError(error);
     }
+  }
+
+  private releaseStandaloneFile(path: string): void {
+    const standalone = this.standaloneFiles.get(path);
+    if (!standalone) return;
+    this.standaloneFiles.delete(path);
+    void closeStandaloneFile(standalone.fileId);
+  }
+
+  private releaseAllStandaloneFiles(): void {
+    const fileIds = new Set(
+      [...this.standaloneFiles.values()].map((standalone) => standalone.fileId),
+    );
+    this.standaloneFiles.clear();
+    for (const fileId of fileIds) void closeStandaloneFile(fileId);
   }
 
   private showQuickOpen(): void {
@@ -2152,7 +2279,8 @@ class NullPointerApp {
     const key = event.key.toLowerCase();
     if (key === "o") {
       event.preventDefault();
-      void this.chooseAndOpenProject();
+      if (event.shiftKey) void this.chooseAndOpenProject();
+      else void this.chooseAndOpenStandaloneFile();
     } else if (key === "p") {
       event.preventDefault();
       this.showQuickOpen();
@@ -2269,10 +2397,22 @@ class NullPointerApp {
     const active = this.editor.active;
     const hasProject = this.project !== null;
     const researchActive = this.workspaceView === "research";
+    const editorVisible = !researchActive && active !== null;
     this.welcome.classList.toggle("hidden", researchActive || active !== null);
-    this.editorHost.classList.toggle("hidden", researchActive || active === null);
+    this.editorLayout.classList.toggle("hidden", !editorVisible);
+    if (
+      editorVisible &&
+      active &&
+      this.editor.viewMode(active) !== "hex" &&
+      (extension(active) === "md" || extension(active) === "markdown")
+    ) {
+      this.markdownPreview.show(active, this.editor.content(active) ?? "");
+    } else {
+      this.markdownPreview.hide();
+    }
     this.tabs.classList.toggle("empty", this.editor.paths.length === 0);
-    this.saveButton.disabled = researchActive || !active || !this.dirty.has(active);
+    this.saveButton.disabled =
+      researchActive || !active || this.editor.isReadOnly(active) || !this.dirty.has(active);
     this.newEntryButton.disabled = !hasProject;
     this.refreshButton.disabled = !hasProject;
     this.scmRefreshButton.disabled = !hasProject || this.gitLoading;
@@ -2281,15 +2421,47 @@ class NullPointerApp {
     this.scmBadge.classList.toggle("hidden", !hasProject || sourceChanges === 0);
     this.cursorStatus.textContent =
       researchActive ? "Research" : active ? this.cursorStatus.textContent : "Ln —, Col —";
-    this.languageStatus.textContent =
-      researchActive ? "Markdown" : active ? languageName(active) : "Plain Text";
+    const activeViewMode = active ? this.editor.viewMode(active) : null;
+    this.languageStatus.textContent = researchActive
+      ? "Markdown"
+      : activeViewMode === "hex"
+        ? "Hex text"
+        : activeViewMode === "utf16"
+          ? "UTF-16"
+          : active
+            ? languageName(active)
+            : "Plain Text";
     this.generalStatus.textContent = researchActive
       ? "Research workspace"
       : active
-        ? this.workspaceDisplayPath(active)
+        ? `${this.editor.isReadOnly(active) ? "Read-only · " : ""}${this.workspaceDisplayPath(active)}`
         : hasProject
           ? this.activeWorkspaceRoot()?.rootPath ?? ""
           : "Ready";
+  }
+
+  private announceFileView(document: FileDocument): void {
+    if (!document.readOnly) return;
+    const partial = document.truncated ? " Only the beginning is shown." : "";
+    if (document.viewMode === "hex") {
+      this.toast(
+        `Opened ${basename(document.path)} as a read-only hex text view.${partial}`,
+        "neutral",
+        4200,
+      );
+    } else if (document.viewMode === "utf16") {
+      this.toast(
+        `Opened ${basename(document.path)} as read-only UTF-16 text.${partial}`,
+        "neutral",
+        3600,
+      );
+    } else {
+      this.toast(
+        `Opened a read-only partial text preview of ${basename(document.path)}.`,
+        "neutral",
+        3600,
+      );
+    }
   }
 
   private setBusy(busy: boolean, message?: string): void {
@@ -2411,12 +2583,15 @@ element<HTMLElement>("#app").innerHTML = `
         <span class="brand-name">NullPointer</span>
       </div>
       <div class="topbar-center">
-        <button class="project-switcher" id="open-folder-button" type="button" title="Open folder (Ctrl+O)">
+        <button class="project-switcher" id="open-folder-button" type="button" title="Open workspace folder (Ctrl+Shift+O)">
           ${icon("folder-open", 18)}
           <span id="project-name">No folder open</span>
         </button>
       </div>
       <div class="topbar-actions">
+        <button class="icon-button" id="open-file-button" type="button" title="Open file (Ctrl+O)" aria-label="Open file">
+          ${icon("file", 19)}
+        </button>
         <button class="quick-trigger" id="quick-open-button" type="button" title="Quick open (Ctrl+P)">
           ${icon("search", 17)}<span>Go to file</span><kbd>Ctrl P</kbd>
         </button>
@@ -2632,16 +2807,42 @@ element<HTMLElement>("#app").innerHTML = `
             <p class="welcome-copy">A quiet, native editor with everything essential and nothing in the way.</p>
             <div class="welcome-actions">
               <button class="primary-button" id="welcome-open-button" type="button">${icon("folder-open", 18)} Open folder</button>
+              <button class="secondary-button" id="welcome-open-file-button" type="button">${icon("file", 17)} Open file</button>
               <button class="secondary-button" id="welcome-quick-button" type="button">${icon("search", 18)} Quick open <kbd>Ctrl P</kbd></button>
             </div>
             <div class="shortcut-grid">
+              <span><kbd>Ctrl O</kbd> Open file</span>
               <span><kbd>Ctrl S</kbd> Save</span>
-              <span><kbd>Ctrl N</kbd> New file</span>
               <span><kbd>Ctrl B</kbd> Sidebar</span>
             </div>
           </div>
         </div>
-        <div class="editor-host hidden" id="editor-host"></div>
+        <div class="editor-layout hidden" id="editor-layout">
+          <div class="editor-host" id="editor-host"></div>
+          <div
+            class="markdown-preview-resizer"
+            id="markdown-preview-resizer"
+            role="separator"
+            aria-label="Resize Markdown preview"
+            aria-orientation="vertical"
+            aria-valuemin="15"
+            aria-valuemax="85"
+            aria-valuenow="50"
+            tabindex="0"
+          ></div>
+          <aside
+            class="markdown-preview-panel"
+            id="markdown-preview-panel"
+            aria-label="Markdown preview"
+            aria-hidden="true"
+          >
+            <header class="markdown-preview-header">
+              <strong>Markdown preview</strong>
+              <span id="markdown-preview-status">Live</span>
+            </header>
+            <article class="markdown-preview-content" id="markdown-preview-content"></article>
+          </aside>
+        </div>
       </section>
     </main>
 

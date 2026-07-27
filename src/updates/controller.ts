@@ -146,7 +146,7 @@ export class UpdatesController {
   }
 
   automaticUpdatesEnabled(): boolean {
-    return this.runtimeReady && this.automatic && !this.portableBuild;
+    return this.runtimeReady && this.automatic;
   }
 
   async refresh(): Promise<void> {
@@ -226,8 +226,7 @@ export class UpdatesController {
     if (
       this.installingVersion ||
       !this.currentVersion ||
-      !this.productionBuild ||
-      this.portableBuild
+      !this.productionBuild
     ) {
       return;
     }
@@ -317,19 +316,17 @@ export class UpdatesController {
   }
 
   private renderAutomaticPreference(): void {
-    this.automaticToggle.disabled = !this.runtimeReady || this.portableBuild;
-    this.automaticToggle.checked = this.portableBuild ? false : this.automatic;
+    this.automaticToggle.disabled = !this.runtimeReady;
+    this.automaticToggle.checked = this.automatic;
     this.automaticCaption.textContent = !this.runtimeReady
       ? "Detecting application mode…"
-      : this.portableBuild
-        ? "Replace the portable folder to update"
-        : this.automatic
-          ? "Checks quietly every 30 minutes"
-          : "Manual checks only";
+      : this.automatic
+        ? "Checks quietly every 30 minutes"
+        : "Manual checks only";
     this.securityCopy.textContent = !this.runtimeReady
       ? "Detecting application update capabilities…"
       : this.portableBuild
-        ? "Portable builds do not modify themselves. Download replacements only from the official GitHub Releases."
+        ? "Portable updates are signature-verified, preserve data, and roll back automatically if the new build cannot start."
         : "Every installer is verified with the app signing key before it can run.";
   }
 
@@ -344,10 +341,7 @@ export class UpdatesController {
             compareVersions(release.version, this.currentVersion ?? release.version) > 0,
         )
       : null;
-    if (this.portableBuild && this.currentVersion) {
-      this.summaryStatus.textContent = "Portable build";
-      this.summaryStatus.dataset.tone = "neutral";
-    } else if (!this.productionBuild && this.currentVersion) {
+    if (!this.productionBuild && this.currentVersion) {
       this.summaryStatus.textContent = "Development build";
       this.summaryStatus.dataset.tone = "neutral";
     } else if (latest) {
@@ -486,9 +480,6 @@ export class UpdatesController {
       : 0;
     if (!this.runtimeReady) {
       action.textContent = "Loading…";
-      action.disabled = true;
-    } else if (this.portableBuild) {
-      action.textContent = "Portable ZIP required";
       action.disabled = true;
     } else if (!this.productionBuild) {
       action.textContent = "Packaged builds only";
