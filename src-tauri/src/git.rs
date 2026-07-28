@@ -1,4 +1,6 @@
 use serde::Serialize;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::{HashSet, VecDeque},
     ffi::OsStr,
@@ -11,6 +13,8 @@ const MAX_REPOSITORIES: usize = 32;
 const MAX_SCAN_DIRECTORIES: usize = 5_000;
 const MAX_SCAN_DEPTH: usize = 5;
 const MAX_GRAPH_COMMITS: usize = 40;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -187,7 +191,7 @@ fn push_repository(repository: &Path) -> Result<(), String> {
 }
 
 fn ensure_git_available() -> Result<(), String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("--version")
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
@@ -488,7 +492,7 @@ fn run_git<const N: usize>(
     arguments: [&str; N],
     readonly: bool,
 ) -> Result<Output, String> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command
         .arg("-C")
         .arg(repository)
@@ -514,6 +518,13 @@ fn run_git<const N: usize>(
             message
         })
     }
+}
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 fn has_git_metadata(directory: &Path) -> bool {
@@ -629,7 +640,7 @@ mod tests {
         fs::create_dir(workspace_root.path().join(".git")).expect("invalid marker");
         let repository = workspace_root.path().join("packages").join("app");
         fs::create_dir_all(&repository).expect("repository directory");
-        let init = Command::new("git")
+        let init = git_command()
             .arg("-C")
             .arg(&repository)
             .arg("init")
@@ -657,7 +668,7 @@ mod tests {
 
         let temporary = TempDir::new().expect("temporary repository");
         let repository = fs::canonicalize(temporary.path()).expect("canonical repository");
-        let init = Command::new("git")
+        let init = git_command()
             .arg("-C")
             .arg(&repository)
             .arg("init")
@@ -712,7 +723,7 @@ mod tests {
         );
 
         let remote = TempDir::new().expect("temporary remote");
-        let init_remote = Command::new("git")
+        let init_remote = git_command()
             .arg("-C")
             .arg(remote.path())
             .args(["init", "--bare"])
