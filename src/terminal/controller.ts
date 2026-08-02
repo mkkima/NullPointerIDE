@@ -12,6 +12,7 @@ import {
   type TerminalShell,
 } from "../services/native";
 import { icon } from "../ui/icons";
+import { shouldCopyTerminalSelection } from "./keyboard";
 
 const SETTINGS_KEY = "nullpointer:terminal-settings";
 const HEIGHT_KEY = "nullpointer:terminal-height";
@@ -362,6 +363,9 @@ export class TerminalController {
       resizeTimer: null,
       cwd: null,
     };
+    terminal.attachCustomKeyEventHandler((event) =>
+      this.handleTerminalKeyEvent(session, event),
+    );
     this.enteringClientIds.add(clientId);
     this.sessions.push(session);
     this.views.append(view);
@@ -391,6 +395,51 @@ export class TerminalController {
 
     this.activate(session.clientId);
     await this.startSession(session);
+  }
+
+  private handleTerminalKeyEvent(session: TerminalSession, event: KeyboardEvent): boolean {
+    if (!shouldCopyTerminalSelection(event, session.terminal.hasSelection())) return true;
+
+    const selection = session.terminal.getSelection();
+    if (selection.length === 0) return true;
+    event.preventDefault();
+    event.stopPropagation();
+    void this.copyTerminalSelection(selection);
+    return false;
+  }
+
+  private async copyTerminalSelection(selection: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(selection);
+      return;
+    } catch {
+      // WebView clipboard access can be unavailable, so keep a synchronous fallback.
+    }
+
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const input = document.createElement("textarea");
+    input.value = selection;
+    input.setAttribute("readonly", "");
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    input.style.pointerEvents = "none";
+    document.body.append(input);
+
+    let copied = false;
+    try {
+      input.select();
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    } finally {
+      input.remove();
+      previouslyFocused?.focus({ preventScroll: true });
+    }
+
+    if (!copied) {
+      this.callbacks.onToast("Could not copy the terminal selection.", "error", 4000);
+    }
   }
 
   private async startSession(session: TerminalSession): Promise<void> {

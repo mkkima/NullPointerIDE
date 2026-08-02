@@ -1,6 +1,8 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::{
     collections::HashMap,
     fs,
@@ -396,7 +398,49 @@ fn resolve_cwd(cwd: Option<&str>) -> TerminalResult<PathBuf> {
             "Terminal working directory must be a folder.",
         ));
     }
-    Ok(canonical)
+    shell_compatible_cwd(&canonical)
+}
+
+fn shell_compatible_cwd(path: &Path) -> TerminalResult<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        let Some(Component::Prefix(prefix)) = components.next() else {
+            return Ok(path.to_path_buf());
+        };
+
+        let mut normalized = match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut root = OsString::from(r"\\");
+                root.push(server);
+                root.push(r"\");
+                root.push(share);
+                PathBuf::from(root)
+            }
+            Prefix::Verbatim(_) => {
+                return Err(TerminalError::new(
+                    "unsupported_terminal_cwd",
+                    "The selected folder uses a Windows device path that shells cannot use as a working directory.",
+                ));
+            }
+            _ => return Ok(path.to_path_buf()),
+        };
+
+        for component in components {
+            if !matches!(component, Component::RootDir) {
+                normalized.push(component.as_os_str());
+            }
+        }
+        Ok(normalized)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(path.to_path_buf())
+    }
 }
 
 fn build_command(shell: TerminalShell) -> TerminalResult<CommandBuilder> {
@@ -494,6 +538,35 @@ mod tests {
         let file = directory.path().join("file.txt");
         fs::write(&file, b"fixture").expect("fixture should be written");
         assert!(resolve_cwd(file.to_str()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn converts_verbatim_disk_paths_for_shell_working_directories() {
+        let resolved = shell_compatible_cwd(Path::new(r"\\?\C:\workspace\Silenia"))
+            .expect("verbatim disk path should be supported");
+
+        assert_eq!(resolved, PathBuf::from(r"C:\workspace\Silenia"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn converts_verbatim_unc_paths_without_losing_the_network_share() {
+        let resolved = shell_compatible_cwd(Path::new(r"\\?\UNC\server\share\project"))
+            .expect("verbatim UNC path should be supported");
+
+        assert_eq!(resolved, PathBuf::from(r"\\server\share\project"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolved_terminal_directories_are_accepted_by_windows_shells() {
+        let directory = tempfile::tempdir().expect("temp directory should be created");
+        let resolved = resolve_cwd(directory.path().to_str())
+            .expect("temporary directory should be a valid terminal cwd");
+
+        assert!(!resolved.to_string_lossy().starts_with(r"\\?\"));
+        assert!(resolved.is_dir());
     }
 
     #[test]
