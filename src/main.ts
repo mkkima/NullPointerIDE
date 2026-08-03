@@ -1,6 +1,7 @@
 import "@fontsource-variable/inter";
 import "./styles/main.css";
 import { EditorController } from "./editor/controller";
+import { EmulatorController } from "./emulators/controller";
 import { MarkdownPreviewController } from "./markdown/controller";
 import { ResearchController } from "./research/controller";
 import { TerminalController } from "./terminal/controller";
@@ -66,7 +67,7 @@ const GIT_COMMIT_OPTIONS: readonly {
 const ACTIVITYBAR_WIDTH = 56;
 const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 type SidebarView = "explorer" | "source-control" | "updates";
-type WorkspaceView = "editor" | "research";
+type WorkspaceView = "editor" | "research" | "emulators";
 const SIDEBAR_VIEW_ORDER: readonly SidebarView[] = ["explorer", "source-control", "updates"];
 
 function element<T extends HTMLElement>(selector: string): T {
@@ -86,6 +87,7 @@ class NullPointerApp {
   private readonly projectPath = element<HTMLElement>("#project-path");
   private readonly sidebarTitle = element<HTMLElement>("#sidebar-title");
   private readonly explorerView = element<HTMLElement>("#explorer-view");
+  private readonly emulatorView = element<HTMLElement>("#emulator-view");
   private readonly researchView = element<HTMLElement>("#research-view");
   private readonly explorerActions = element<HTMLElement>("#explorer-actions");
   private readonly scmActions = element<HTMLElement>("#scm-actions");
@@ -127,6 +129,7 @@ class NullPointerApp {
   private readonly entryInput = element<HTMLInputElement>("#entry-path");
   private readonly entryError = element<HTMLElement>("#entry-error");
   private readonly editor: EditorController;
+  private readonly emulators: EmulatorController;
   private readonly markdownPreview: MarkdownPreviewController;
   private readonly research: ResearchController;
   private readonly terminal: TerminalController;
@@ -210,6 +213,12 @@ class NullPointerApp {
         onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
       },
     );
+    this.emulators = new EmulatorController(this.emulatorView, {
+      onOpenAdbShell: (serial) => {
+        void this.terminal.runCommand(`adb -s ${serial} shell`, `ADB · ${serial}`);
+      },
+      onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
+    });
     this.updates = new UpdatesController(this.updatesView, {
       canInstall: () =>
         this.dirty.size === 0 &&
@@ -323,6 +332,9 @@ class NullPointerApp {
     });
     element<HTMLButtonElement>("#activity-research").addEventListener("click", () => {
       this.showResearchWorkspace();
+    });
+    element<HTMLButtonElement>("#activity-emulators").addEventListener("click", () => {
+      this.showEmulatorsWorkspace();
     });
     element<HTMLButtonElement>("#activity-search").addEventListener("click", () => {
       this.showQuickOpen();
@@ -2342,7 +2354,10 @@ class NullPointerApp {
   private showResearchWorkspace(): void {
     const viewChanged = this.workspaceView !== "research";
     this.workspaceView = "research";
+    this.workspace.classList.remove("emulators-active");
     this.workspace.classList.add("research-active");
+    this.emulatorView.classList.add("hidden");
+    this.emulators.deactivate();
     this.researchView.classList.remove("hidden");
     if (!this.sidebarCollapsed) {
       this.sidebarCollapsed = true;
@@ -2353,11 +2368,30 @@ class NullPointerApp {
     if (viewChanged) this.animateViewEntrance(this.researchView, 1);
   }
 
+  private showEmulatorsWorkspace(): void {
+    const viewChanged = this.workspaceView !== "emulators";
+    this.workspaceView = "emulators";
+    this.workspace.classList.remove("research-active");
+    this.workspace.classList.add("emulators-active");
+    this.researchView.classList.add("hidden");
+    this.emulatorView.classList.remove("hidden");
+    if (!this.sidebarCollapsed) {
+      this.sidebarCollapsed = true;
+      this.shell.classList.add("sidebar-collapsed");
+    }
+    this.emulators.activate();
+    this.syncChrome();
+    this.syncSidebarActivity();
+    if (viewChanged) this.animateViewEntrance(this.emulatorView, 1);
+  }
+
   private showEditorWorkspace(): void {
     if (this.workspaceView === "editor") return;
     this.workspaceView = "editor";
-    this.workspace.classList.remove("research-active");
+    this.workspace.classList.remove("research-active", "emulators-active");
     this.researchView.classList.add("hidden");
+    this.emulatorView.classList.add("hidden");
+    this.emulators.deactivate();
     this.syncChrome();
     this.syncSidebarActivity();
   }
@@ -2391,14 +2425,20 @@ class NullPointerApp {
       "active",
       this.workspaceView === "research",
     );
+    element<HTMLButtonElement>("#activity-emulators").classList.toggle(
+      "active",
+      this.workspaceView === "emulators",
+    );
   }
 
   private syncChrome(): void {
     const active = this.editor.active;
     const hasProject = this.project !== null;
     const researchActive = this.workspaceView === "research";
-    const editorVisible = !researchActive && active !== null;
-    this.welcome.classList.toggle("hidden", researchActive || active !== null);
+    const emulatorsActive = this.workspaceView === "emulators";
+    const toolActive = researchActive || emulatorsActive;
+    const editorVisible = !toolActive && active !== null;
+    this.welcome.classList.toggle("hidden", toolActive || active !== null);
     this.editorLayout.classList.toggle("hidden", !editorVisible);
     if (
       editorVisible &&
@@ -2412,7 +2452,7 @@ class NullPointerApp {
     }
     this.tabs.classList.toggle("empty", this.editor.paths.length === 0);
     this.saveButton.disabled =
-      researchActive || !active || this.editor.isReadOnly(active) || !this.dirty.has(active);
+      toolActive || !active || this.editor.isReadOnly(active) || !this.dirty.has(active);
     this.newEntryButton.disabled = !hasProject;
     this.refreshButton.disabled = !hasProject;
     this.scmRefreshButton.disabled = !hasProject || this.gitLoading;
@@ -2420,24 +2460,34 @@ class NullPointerApp {
     this.scmBadge.textContent = sourceChanges > 99 ? "99+" : String(sourceChanges);
     this.scmBadge.classList.toggle("hidden", !hasProject || sourceChanges === 0);
     this.cursorStatus.textContent =
-      researchActive ? "Research" : active ? this.cursorStatus.textContent : "Ln —, Col —";
+      researchActive
+        ? "Research"
+        : emulatorsActive
+          ? "Emulators"
+          : active
+            ? this.cursorStatus.textContent
+            : "Ln —, Col —";
     const activeViewMode = active ? this.editor.viewMode(active) : null;
     this.languageStatus.textContent = researchActive
       ? "Markdown"
-      : activeViewMode === "hex"
-        ? "Hex text"
-        : activeViewMode === "utf16"
-          ? "UTF-16"
-          : active
-            ? languageName(active)
-            : "Plain Text";
+      : emulatorsActive
+        ? "Android"
+        : activeViewMode === "hex"
+          ? "Hex text"
+          : activeViewMode === "utf16"
+            ? "UTF-16"
+            : active
+              ? languageName(active)
+              : "Plain Text";
     this.generalStatus.textContent = researchActive
       ? "Research workspace"
-      : active
-        ? `${this.editor.isReadOnly(active) ? "Read-only · " : ""}${this.workspaceDisplayPath(active)}`
-        : hasProject
-          ? this.activeWorkspaceRoot()?.rootPath ?? ""
-          : "Ready";
+      : emulatorsActive
+        ? "Android virtual devices"
+        : active
+          ? `${this.editor.isReadOnly(active) ? "Read-only · " : ""}${this.workspaceDisplayPath(active)}`
+          : hasProject
+            ? this.activeWorkspaceRoot()?.rootPath ?? ""
+            : "Ready";
   }
 
   private announceFileView(document: FileDocument): void {
@@ -2611,6 +2661,9 @@ element<HTMLElement>("#app").innerHTML = `
       <button class="activity-button" id="activity-research" type="button" title="Research" aria-label="Research">
         ${icon("flask", 23)}
       </button>
+      <button class="activity-button" id="activity-emulators" type="button" title="Emulators" aria-label="Emulators">
+        ${icon("smartphone", 23)}
+      </button>
       <button class="activity-button" id="activity-source-control" type="button" title="Source Control" aria-label="Source Control">
         ${icon("git-branch", 23)}
         <span class="activity-badge hidden" id="scm-badge">0</span>
@@ -2733,6 +2786,42 @@ element<HTMLElement>("#app").innerHTML = `
     <main class="workspace" id="workspace">
       <div class="tabs" id="tabs" role="tablist" aria-label="Open editors"></div>
       <section class="editor-surface">
+        <section class="emulator-view hidden" id="emulator-view" aria-label="Android emulators">
+          <header class="emulator-header">
+            <div class="emulator-title">
+              <span>${icon("smartphone", 23)}</span>
+              <div>
+                <strong>Android emulators</strong>
+                <small id="emulator-sdk-path">Not checked yet</small>
+              </div>
+            </div>
+            <button class="emulator-refresh" id="emulator-refresh" type="button" data-emulator-action="refresh">
+              ${icon("refresh", 16)} Refresh
+            </button>
+          </header>
+          <div class="emulator-content">
+            <div class="emulator-summary" id="emulator-summary"></div>
+            <div class="emulator-warnings hidden" id="emulator-warnings"></div>
+            <section class="emulator-section">
+              <header>
+                <div>
+                  <strong>Virtual devices</strong>
+                  <small>Installed Android Virtual Devices</small>
+                </div>
+              </header>
+              <div class="emulator-avd-list" id="emulator-avd-list"></div>
+            </section>
+            <section class="emulator-section hidden" id="emulator-device-section">
+              <header>
+                <div>
+                  <strong>Other connected devices</strong>
+                  <small>Physical or externally managed ADB devices</small>
+                </div>
+              </header>
+              <div class="emulator-device-list" id="emulator-device-list"></div>
+            </section>
+          </div>
+        </section>
         <section class="research-view hidden" id="research-view" aria-label="Research">
           <button
             class="research-folder-button"

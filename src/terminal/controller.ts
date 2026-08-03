@@ -75,6 +75,8 @@ interface TerminalSession {
   writingInput: boolean;
   resizeTimer: number | null;
   cwd: string | null;
+  startupCommand: string | null;
+  startupLabel: string | null;
 }
 
 export interface TerminalWorkspaceFolder {
@@ -293,7 +295,11 @@ export class TerminalController {
     else this.focusActive();
   }
 
-  async createSession(openPanel = true): Promise<void> {
+  async createSession(
+    openPanel = true,
+    startupCommand: string | null = null,
+    startupLabel: string | null = null,
+  ): Promise<void> {
     if (this.sessions.length + this.pendingSessions >= MAX_SESSIONS) {
       this.callbacks.onToast(
         `At most ${MAX_SESSIONS} terminals can run at once.`,
@@ -362,6 +368,8 @@ export class TerminalController {
       writingInput: false,
       resizeTimer: null,
       cwd: null,
+      startupCommand,
+      startupLabel,
     };
     terminal.attachCustomKeyEventHandler((event) =>
       this.handleTerminalKeyEvent(session, event),
@@ -386,7 +394,7 @@ export class TerminalController {
       }),
       terminal.onTitleChange((title) => {
         const cleaned = title.replace(/[\u0000-\u001f\u007f]/g, "").trim();
-        if (cleaned) {
+        if (cleaned && !session.startupLabel) {
           session.label = cleaned.slice(0, 80);
           this.renderTabs();
         }
@@ -395,6 +403,18 @@ export class TerminalController {
 
     this.activate(session.clientId);
     await this.startSession(session);
+  }
+
+  async runCommand(command: string, label: string): Promise<void> {
+    if (
+      command.length === 0 ||
+      command.length > 4096 ||
+      /[\u0000-\u0008\u000a-\u001f\u007f]/.test(command)
+    ) {
+      this.callbacks.onToast("The terminal command is invalid.", "error", 4000);
+      return;
+    }
+    await this.createSession(true, command, label.slice(0, 80));
   }
 
   private handleTerminalKeyEvent(session: TerminalSession, event: KeyboardEvent): boolean {
@@ -447,7 +467,7 @@ export class TerminalController {
     const generation = session.generation;
     session.exited = false;
     session.backendId = null;
-    session.label = shellLabel(session.shell);
+    session.label = session.startupLabel ?? shellLabel(session.shell);
     this.renderTabs();
     this.fitSession(session, false);
 
@@ -465,8 +485,11 @@ export class TerminalController {
       }
       session.backendId = info.id;
       session.cwd = info.cwd;
-      session.label = info.label;
+      session.label = session.startupLabel ?? info.label;
       this.renderTabs();
+      if (session.startupCommand) {
+        session.pendingInput.push(`${session.startupCommand}\r`);
+      }
       void this.flushInput(session);
       this.scheduleBackendResize(session);
     } catch (error) {

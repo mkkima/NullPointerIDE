@@ -4,6 +4,7 @@ import type {
   AppError,
   AppRelease,
   AppUpdateEvent,
+  AndroidEmulatorSnapshot,
   CreateKind,
   FileDocument,
   FileEntry,
@@ -386,6 +387,36 @@ export async function resizeTerminal(
 export async function killTerminal(id: number): Promise<void> {
   requireDesktopRuntime();
   return invoke<void>("terminal_kill", { id });
+}
+
+export async function getAndroidEmulators(): Promise<AndroidEmulatorSnapshot> {
+  requireDesktopRuntime();
+  return invoke<AndroidEmulatorSnapshot>("get_android_emulators");
+}
+
+export async function launchAndroidEmulator(
+  name: string,
+  coldBoot: boolean,
+): Promise<AndroidEmulatorSnapshot> {
+  requireDesktopRuntime();
+  return invoke<AndroidEmulatorSnapshot>("launch_android_emulator", {
+    name,
+    coldBoot,
+  });
+}
+
+export async function stopAndroidEmulator(
+  serial: string,
+): Promise<AndroidEmulatorSnapshot> {
+  requireDesktopRuntime();
+  return invoke<AndroidEmulatorSnapshot>("stop_android_emulator", { serial });
+}
+
+export async function rebootAndroidEmulator(
+  serial: string,
+): Promise<AndroidEmulatorSnapshot> {
+  requireDesktopRuntime();
+  return invoke<AndroidEmulatorSnapshot>("reboot_android_emulator", { serial });
 }
 
 export function toAppError(error: unknown): AppError {

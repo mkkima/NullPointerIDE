@@ -103,6 +103,40 @@ export interface AppError {
   readonly message: string;
 }
 
+export type AndroidAvdStatus = "stopped" | "starting" | "running" | "offline";
+
+export interface AndroidAvd {
+  readonly name: string;
+  readonly displayName: string;
+  readonly target: string | null;
+  readonly abi: string | null;
+  readonly device: string | null;
+  readonly resolution: string | null;
+  readonly playStore: boolean;
+  readonly status: AndroidAvdStatus;
+  readonly serial: string | null;
+  readonly model: string | null;
+}
+
+export interface AndroidDevice {
+  readonly serial: string;
+  readonly state: string;
+  readonly model: string | null;
+  readonly product: string | null;
+  readonly device: string | null;
+  readonly isEmulator: boolean;
+  readonly avdName: string | null;
+}
+
+export interface AndroidEmulatorSnapshot {
+  readonly sdkRoot: string | null;
+  readonly adbAvailable: boolean;
+  readonly emulatorAvailable: boolean;
+  readonly avds: readonly AndroidAvd[];
+  readonly devices: readonly AndroidDevice[];
+  readonly warnings: readonly string[];
+}
+
 export type CreateKind = "file" | "directory";
 
 export interface GitWorkspace {

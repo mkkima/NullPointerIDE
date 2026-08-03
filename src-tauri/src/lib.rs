@@ -1,3 +1,4 @@
+mod emulator;
 mod git;
 #[cfg(windows)]
 mod portable_update;
@@ -2102,6 +2103,7 @@ pub fn run() {
             Ok(())
         })
         .manage(AppState::default())
+        .manage(emulator::EmulatorManager::default())
         .manage(terminal::TerminalManager::default())
         .manage(UpdateState::default())
         .manage(runtime_mode)
@@ -2130,6 +2132,10 @@ pub fn run() {
             git_unstage_file,
             git_stage_all,
             git_commit_repository,
+            emulator::get_android_emulators,
+            emulator::launch_android_emulator,
+            emulator::stop_android_emulator,
+            emulator::reboot_android_emulator,
             terminal::terminal_start,
             terminal::terminal_write,
             terminal::terminal_resize,

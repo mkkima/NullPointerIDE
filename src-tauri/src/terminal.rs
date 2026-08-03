@@ -170,6 +170,15 @@ pub fn terminal_start(
     command.cwd(&cwd);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    if let Some(platform_tools) = crate::emulator::android_platform_tools_directory() {
+        let mut paths = vec![platform_tools];
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        if let Ok(path) = std::env::join_paths(paths) {
+            command.env("PATH", path);
+        }
+    }
 
     let mut child = pair.slave.spawn_command(command).map_err(|error| {
         TerminalError::new(
