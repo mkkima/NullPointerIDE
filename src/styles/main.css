@@ -327,6 +327,120 @@ kbd {
   font-weight: 700;
 }
 
+.app-settings-popover {
+  position: fixed;
+  inset: auto auto 36px 48px;
+  width: 304px;
+  margin: 0;
+  padding: 7px;
+  border: 1px solid #303030;
+  border-radius: 12px;
+  color: #d8d8d8;
+  background: #090909;
+  box-shadow: 0 18px 55px #000c;
+}
+
+.app-settings-popover::backdrop { background: transparent; }
+.app-settings-popover:not(:popover-open) { display: none; }
+.app-settings-popover:popover-open { animation: app-settings-in 140ms var(--motion-ease); }
+
+@keyframes app-settings-in {
+  from { opacity: 0; transform: translate3d(-5px, 5px, 0) scale(.985); }
+  to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+
+.app-settings-popover > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 40px;
+  padding: 3px 3px 7px 8px;
+  border-bottom: 1px solid #222;
+}
+
+.app-settings-popover > header > div,
+.app-setting-row > span {
+  display: grid;
+  gap: 1px;
+}
+
+.app-settings-popover > header strong { font-size: 13px; }
+.app-settings-popover > header small { color: #6f6f6f; font-size: 10px; }
+
+.app-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 58px;
+  padding: 8px;
+  border-bottom: 1px solid #1b1b1b;
+}
+
+.app-setting-row strong { color: #d2d2d2; font-size: 12px; font-weight: 560; }
+.app-setting-row small { color: #737373; font-size: 10px; }
+
+.app-scale-stepper {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: 29px 52px 29px;
+  height: 29px;
+  overflow: hidden;
+  border: 1px solid #2c2c2c;
+  border-radius: 8px;
+  background: #060606;
+}
+
+.app-scale-stepper button {
+  display: grid;
+  padding: 0;
+  border: 0;
+  place-items: center;
+  color: #929292;
+  background: transparent;
+  cursor: pointer;
+  transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease;
+}
+
+.app-scale-stepper button:hover:not(:disabled) { color: #eee; background: #ffffff0b; }
+.app-scale-stepper button:disabled { color: #404040; cursor: default; }
+.app-scale-stepper output {
+  display: grid;
+  place-items: center;
+  border-right: 1px solid #252525;
+  border-left: 1px solid #252525;
+  color: #c9c9c9;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.app-scale-reset {
+  display: flex;
+  width: 100%;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  color: #aaa;
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.app-scale-reset:hover:not(:disabled) { color: #eee; background: #ffffff0a; }
+.app-scale-reset:disabled { color: #484848; cursor: default; }
+.app-scale-reset > span { display: flex; gap: 3px; }
+.app-settings-popover kbd { min-width: 18px; padding: 2px 4px; border-radius: 4px; font-size: 9px; }
+.app-settings-hint {
+  margin: 4px 8px 5px;
+  color: #666;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
 .sidebar {
   position: relative;
   grid-column: 2;

@@ -4,6 +4,7 @@ import { EditorController } from "./editor/controller";
 import { EmulatorController } from "./emulators/controller";
 import { MarkdownPreviewController } from "./markdown/controller";
 import { ResearchController } from "./research/controller";
+import { AppSettingsController } from "./settings/controller";
 import { TerminalController } from "./terminal/controller";
 import { checkAndInstallUpdate } from "./services/updater";
 import { UpdatesController } from "./updates/controller";
@@ -132,6 +133,7 @@ class NullPointerApp {
   private readonly emulators: EmulatorController;
   private readonly markdownPreview: MarkdownPreviewController;
   private readonly research: ResearchController;
+  private readonly settings: AppSettingsController;
   private readonly terminal: TerminalController;
   private readonly updates: UpdatesController;
 
@@ -231,6 +233,9 @@ class NullPointerApp {
       onBusy: (busy, message) => this.setBusy(busy, message),
       onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
     });
+    this.settings = new AppSettingsController(this.shell, {
+      onToast: (message, tone, timeout) => this.toast(message, tone, timeout),
+    });
     this.restoreSidebarWidth();
     this.bindEvents();
     this.syncChrome();
@@ -238,6 +243,7 @@ class NullPointerApp {
 
   start(): void {
     this.removeStorage(LEGACY_LAST_PROJECT_KEY);
+    this.settings.start();
     void this.research.restore();
     void this.updates.start().then(() => {
       window.setTimeout(() => void this.checkForUpdates(), 1_200);
@@ -2672,10 +2678,35 @@ element<HTMLElement>("#app").innerHTML = `
         ${icon("history", 23)}
       </button>
       <span class="activity-spacer"></span>
+      <button class="activity-button" id="app-settings-button" type="button" title="Settings" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="app-settings-popover">
+        ${icon("settings", 22)}
+      </button>
       <button class="activity-button" id="toggle-sidebar-button" type="button" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar">
         ${icon("panel-left", 22)}
       </button>
     </aside>
+
+    <div class="app-settings-popover" id="app-settings-popover" popover="manual" role="dialog" aria-label="Application settings">
+      <header>
+        <div><strong>Settings</strong><small>Saved automatically</small></div>
+        <button class="mini-button" type="button" popovertarget="app-settings-popover" popovertargetaction="hide" aria-label="Close settings">
+          ${icon("x", 15)}
+        </button>
+      </header>
+      <section class="app-setting-row">
+        <span><strong>Interface scale</strong><small>Entire application</small></span>
+        <div class="app-scale-stepper" role="group" aria-label="Interface scale">
+          <button id="app-scale-decrease" type="button" aria-label="Decrease interface scale">${icon("minus", 13)}</button>
+          <output id="app-scale-value" aria-label="Current interface scale" aria-live="polite">100%</output>
+          <button id="app-scale-increase" type="button" aria-label="Increase interface scale">${icon("plus", 13)}</button>
+        </div>
+      </section>
+      <button class="app-scale-reset" id="app-scale-reset" type="button">
+        Reset to 100%
+        <span><kbd>Ctrl</kbd><kbd>0</kbd></span>
+      </button>
+      <p class="app-settings-hint"><kbd>Ctrl</kbd><kbd>+</kbd> / <kbd>−</kbd> changes scale in 5% steps.</p>
+    </div>
 
     <aside class="sidebar">
       <div class="sidebar-header">
